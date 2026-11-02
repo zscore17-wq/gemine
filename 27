@@ -1,0 +1,279 @@
+### 1. Talablar tahlili (Requirements Analysis)
+
+"Serial Plus" loyihasi — bu Telegram Bot va Telegram Mini App orqali foydalanuvchilarga serial va epizodlarni ko‘rish, Premium obunalarni rasmiylashtirish hamda individual xaridlarni amalga oshirish imkonini beruvchi, yagona backend va ma'lumotlar bazasiga ega platformadir.
+
+* **Foydalanuvchi doirasi:**
+* **Oddiy foydalanuvchilar:** Katalog bo‘yicha izlash, bepul epizodlarni tomosha qilish, majburiy kanallarga obuna bo‘lish, individual epizod/serial xarid qilish yoki Premium obuna (7, 30, 90 kun) sotib olish.
+* **Adminlar:** Kontent (seriallar, mavsumlar, epizodlar), storage kanallar, tariflar, foydalanuvchilar, to‘lovlar, audit loglar va tizim sozlamalarini boshqarish.
+
+
+* **Integratsiya nuqtalari:**
+* Telegram Bot API & Telegram Mini App `initData`.
+* Telegram Private Storage Channels (Video fayllarni saqlash va indekslash).
+* Click va Payme to‘lov provayderlari (dastlabki bosqichda test va qo‘lda boshqarish rejimi bilan).
+
+
+
+---
+
+### 2. Qarama-qarshiliklar va yetishmayotgan ma'lumotlar (Ambiguities & Constraints)
+
+1. **Storage kanallarini skanerlash (Historic Scan vs Real-time):**
+* *Muammo:* Telegram Bot API standart ravishda kanallarning o‘tmishdagi xabarlar tarixini (`history scan`) o‘qiy olmaydi (faqat yangi kelgan xabarlarni kuzatishi mumkin).
+* *Yechim:* Yangi xabarlarni real-vaqtda kuzatish botning `channel_post` voqeasi orqali bajariladi. Tarixiy postlarni diapazon bo‘yicha skanerlash uchun esa fonda MTProto Client (Pyrogram yoki Telethon Userbot session) texnologiyasidan foydalaniladi.
+
+
+2. **Video kontentni uzatish va sizib chiqishidan himoyalash:**
+* *Muammo:* Video fayllarning `file_id` qiymatini ochiq holatda Mini App frontendga berish kontentning tekinga tarqalib ketishiga olib kelishi mumkin.
+* *Yechim:* Mini App'da videolarni ko‘rsatish uchun backend orqali vaqtinchalik tokenga ega bo‘lgan stream URL yoki Bot orqali `protect_content=True` belligi bilan yopiq uzatish usuli qo‘llaniladi.
+
+
+3. **Admin Panel interfeysi texnologiyasi:**
+* *Muammo:* Admin panel alohida SPA (React/Vue) bo‘ladimi yoki FastAPI ichida server-side rendered (Jinja2 + TailwindCSS) dashboard bo‘ladimi?
+* *Yechim:* Loyihaning yaxlitligi va tezkor deployment uchun FastAPI ga integratsiya qilingan Jinja2 + TailwindCSS/Flowbite boshqaruv paneli tanlanadi.
+
+
+
+---
+
+### 3. Professional Arxitektura Taklifi (Architecture Proposal)
+
+Arxitektura **Layered (Klassik Qatlamli)** va **Event-Driven** tamoyillariga asoslanadi:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                          PRESENTATION LAYER                            │
+│  ┌───────────────────────┐  ┌────────────────────┐  ┌────────────────┐ │
+│  │ Telegram Bot (aiogram)│  │ Telegram Mini App  │  │   Web Admin    │ │
+│  │      (Client)         │  │ (JS/HTML Frontend) │  │   Dashboard    │ │
+│  └───────────┬───────────┘  └─────────┬──────────┘  └───────┬────────┘ │
+└──────────────┼────────────────────────┼─────────────────────┼──────────┘
+               │                        │                     │
+┌──────────────┼────────────────────────┼─────────────────────┼──────────┐
+│              ▼                        ▼                     ▼          │
+│                      FASTAPI BACKEND GATEWAY LAYER                     │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │ Auth Middleware (Telegram HMAC-SHA256 initData Validator & JWT)  │  │
+│  │ Rate Limiting (slowapi) | CORS & Security Guards                 │  │
+│  └──────────────────────────────────┬───────────────────────────────┘  │
+└─────────────────────────────────────┼──────────────────────────────────┘
+                                      │
+┌─────────────────────────────────────▼──────────────────────────────────┐
+│                        BUSINESS SERVICE LAYER                          │
+│  ┌──────────────┐ ┌──────────────┐ ┌───────────────┐ ┌──────────────┐  │
+│  │ AuthService  │ │CatalogService│ │PurchaseService│ │IndexerService│  │
+│  └──────────────┘ └──────────────┘ └───────────────┘ └──────────────┘  │
+└─────────────────────────────────────┬──────────────────────────────────┘
+                                      │
+┌─────────────────────────────────────▼──────────────────────────────────┐
+│                   DATA & BACKGROUND PROCESSING LAYER                   │
+│  ┌──────────────────────────────┐     ┌─────────────────────────────┐  │
+│  │ PostgreSQL + SQLAlchemy 2.0  │     │ Redis (Cache & Rate Limit)  │  │
+│  └──────────────────────────────┘     └─────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │ APScheduler / Background Tasks (Storage Scanner & Auto Expiry)   │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────────┘
+
+```
+
+---
+
+### 4. Database ER Modeli (Database Schema Design)
+
+PostgreSQL uchun SQLAlchemy 2.0 Async declarative modellari asosida loyihalashtirilgan relyatsion sxema:
+
+```sql
+-- 1. Users Table
+CREATE TABLE users (
+    id BIGSERIAL PRIMARY KEY,
+    telegram_id VARCHAR(64) NOT NULL UNIQUE,
+    username VARCHAR(64),
+    first_name VARCHAR(128),
+    balance BIGINT NOT NULL DEFAULT 0 CHECK (balance >= 0),
+    is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+    is_blocked BOOLEAN NOT NULL DEFAULT FALSE,
+    premium_expires_at TIMESTAMPTZ NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. Storage Channels Table
+CREATE TABLE storage_channels (
+    id SERIAL PRIMARY KEY,
+    channel_id BIGINT NOT NULL UNIQUE,
+    channel_title VARCHAR(255) NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 3. Series Table
+CREATE TABLE series (
+    id SERIAL PRIMARY KEY,
+    code VARCHAR(32) NOT NULL UNIQUE, -- e.g., 'e1'
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    poster_url VARCHAR(512),
+    free_episodes_count INT NOT NULL DEFAULT 1 CHECK (free_episodes_count >= 0),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 4. Seasons Table
+CREATE TABLE seasons (
+    id SERIAL PRIMARY KEY,
+    series_id INT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+    season_number INT NOT NULL,
+    title VARCHAR(255),
+    CONSTRAINT uq_series_season UNIQUE (series_id, season_number)
+);
+
+-- 5. Episodes Table
+CREATE TABLE episodes (
+    id SERIAL PRIMARY KEY,
+    season_id INT NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+    episode_number INT NOT NULL,
+    title VARCHAR(255),
+    is_free BOOLEAN NOT NULL DEFAULT FALSE,
+    price BIGINT NOT NULL DEFAULT 0 CHECK (price >= 0),
+    telegram_file_id VARCHAR(512) NOT NULL,
+    telegram_message_id BIGINT NOT NULL,
+    storage_channel_id INT REFERENCES storage_channels(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_season_episode UNIQUE (season_id, episode_number)
+);
+
+-- 6. Tariffs Table
+CREATE TABLE tariffs (
+    id SERIAL PRIMARY KEY,
+    days INT NOT NULL CHECK (days > 0),
+    price BIGINT NOT NULL CHECK (price > 0),
+    title VARCHAR(128) NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+-- 7. Purchases Table (Idempotent Transactions)
+CREATE TABLE purchases (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    idempotency_key VARCHAR(128) NOT NULL,
+    item_type VARCHAR(32) NOT NULL, -- 'PREMIUM', 'SERIES', 'EPISODE'
+    item_id INT NULL,
+    price BIGINT NOT NULL CHECK (price >= 0),
+    status VARCHAR(20) NOT NULL DEFAULT 'PROCESSING', -- 'PROCESSING', 'COMPLETED', 'FAILED'
+    response_payload JSONB NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_user_idempotency UNIQUE (user_id, idempotency_key)
+);
+
+-- 8. Mandatory Channels Table
+CREATE TABLE mandatory_channels (
+    id SERIAL PRIMARY KEY,
+    channel_id VARCHAR(64) NOT NULL UNIQUE,
+    channel_url VARCHAR(255) NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+-- 9. Audit Logs Table
+CREATE TABLE audit_logs (
+    id BIGSERIAL PRIMARY KEY,
+    admin_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    action VARCHAR(128) NOT NULL,
+    details JSONB NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+```
+
+---
+
+### 5. Loyiha papkalari strukturasi (Directory Structure)
+
+```text
+serial_plus/
+├── app/
+│   ├── __init__.py
+│   ├── main.py                  # FastAPI ilovasining kirish nuqtasi
+│   ├── api/                     # REST API Marshrutlari (v1)
+│   │   ├── v1/
+│   │   │   ├── auth.py          # Mini App initData autentifikatsiyasi
+│   │   │   ├── catalog.py       # Seriallar, mavsumlar, epizodlar API
+│   │   │   ├── purchases.py     # Idempotent xarid va obuna API
+│   │   │   └── user.py          # Profil va xaridlar tarixi API
+│   ├── admin/                   # Admin Panel Controller va Interfeysi
+│   │   ├── routes.py            # Admin Dashboard endpointlari
+│   │   └── templates/           # Jinja2 HTML shablonlari (TailwindCSS)
+│   ├── bot/                     # aiogram 3 Telegram Bot
+│   │   ├── bot.py               # Bot obyekti va dispatcher
+│   │   ├── handlers/            # Katalog, profil, obuna tekshirish handleri
+│   │   ├── keyboards/           # Inline va Reply tugmalar
+│   │   └── middlewares/         # Auth va SubCheck middlewares
+│   ├── core/                    # Konfiguratsiya va umumiy modullar
+│   │   ├── config.py            # Pydantic BaseSettings (.env va global o'zgaruvchilar)
+│   │   ├── database.py          # SQLAlchemy async session va engine
+│   │   ├── security.py          # HMAC-SHA256 initData va JWT mantiqlari
+│   │   └── logger.py            # Structured logging
+│   ├── models/                  # SQLAlchemy ORM modellari
+│   ├── schemas/                 # Pydantic v2 validation va DTO modellari
+│   ├── services/                # Yagona Biznes Servislar Qatlami
+│   │   ├── auth_service.py
+│   │   ├── catalog_service.py
+│   │   ├── purchase_service.py
+│   │   └── indexer_service.py   # #e1_1_1 teglarini parse qilish va indekslash
+│   └── miniapp/                 # Mini App Frontend fayllari
+│       ├── index.html
+│       ├── css/
+│       └── js/
+├── migrations/                  # Alembic DB Migratsiyalari
+│   ├── env.py
+│   └── versions/
+├── tests/                       # Pytest Test to'plami
+│   ├── conftest.py
+│   ├── test_auth.py
+│   ├── test_catalog.py
+│   └── test_purchases.py
+├── scripts/                     # Ishga tushirish skriptlari
+│   ├── run.ps1                  # Windows PowerShell ishga tushirish skripti
+│   └── deploy_linux.sh          # Linux Production deployment skripti
+├── .env.example
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+├── README.md
+└── DOCUMENTATION.md             # Admin va foydalanuvchi qo'llanmasi
+
+```
+
+---
+
+### 6. Ishlab chiqish bosqichlari va qabul qilish mezonlari (Development Stages & Criteria)
+
+| Bosqich | Tavsif | Qabul Qilish Mezonlari (Acceptance Criteria) |
+| --- | --- | --- |
+| **Bosqich 1** | Infratuzilma, DB sxemasi va Alembic migratsiyalari. | PostgreSQL modellari to'liq yaratilishi, Alembic migratsiyasi clean holatda bajarilishi. |
+| **Bosqich 2** | Core Backend, Auth (HMAC-SHA256) va Pydantic Validation. | `initData` tekshiruvi 100% testlardan o'tishi, soxta header/so'rovlar rad etilishi. |
+| **Bosqich 3** | Storage Channel Indexer xizmati (`#e1_1_1` teg parser). | Telegram postidagi `#e1_1_1` teg to'g'ri ajratilib, bazadagi Serial -> Season -> Episode zanjiriga bog'lanishi. |
+| **Bosqich 4** | Xaridlar va Obuna Servisi (Row Lock + Idempotency). | 10 ta parallel xarid so'rovida balans faqat 1 marta yechilishi (Concurrency Test pass). |
+| **Bosqich 5** | aiogram 3 Telegram Bot va Majburiy obuna tekshiruvi. | Bot katalog va media fayllarni to'g'ri ko'rsatishi, obuna bo'lmagan foydalanuvchini bloklashi. |
+| **Bosqich 6** | Telegram Mini App Frontend (Vanilla JS + HTML5/CSS3). | Mini App interfeysi mobil qurilmada silliq ishlashi, API bilan uzviy bog'lanishi. |
+| **Bosqich 7** | Web Admin Panel Dashboard & Controls. | Full CRUD, statistika, foydalanuvchini bloklash va audit loglar ishlashi. |
+| **Bosqich 8** | Avtomatlashtirilgan Testlar va Kiberxavfsizlik Auditi. | Pytest qamrovi yuqori bo'lishi, barcha xavfsizlik teshiklari tuzatilishi. |
+| **Bosqich 9** | Dockerization, Deploy Skriptlari va Hujjatlashtirish. | `docker-compose up` va skriptlar orqali loyiha birinchi urinishda muammosiz ishga tushishi. |
+
+---
+
+### 7. Avtomatlashtirish imkoniyatlari (Automation)
+
+1. **Storage Post Parsing:** Storage kanaliga kelgan har bir yangi post Regex (`#e(?P<series>\d+)_(?P<season>\d+)_(?P<episode>\d+)`) orqali avtomatik tahlil qilinadi va avtomatik ravishda Bazaga kiritiladi.
+2. **Obunalarning Avto-Expire Bo'lishi:** `APScheduler` orqali fonda har soatda ishlaydigan vazifa muddati tugagan `premium_expires_at` vaqtini tekshirib, foydalanuvchi huquqlarini avtomatik bekor qiladi.
+3. **CI/CD va DB Migratsiyalar:** Docker konteyner ishga tushganida `alembic upgrade head` avtomatik ishlaydi.
+
+---
+
+### Ishlab Chiqishni Boshlashga Tayyorgarlik Declaration
+
+Men loyihaning barcha texnik talablarini, arxitektura va xavfsizlik prinsiplarini to'liq ko'rib chiqdim va tahlil qildim.
+
+**Birinchi ishlab chiqish bosqichini (Bosqich 1: Infratuzilma, Pydantic/SQLAlchemy Modellari va DB Migratsiyalarini yaratish) boshlashga tayyorman.**
+
+Ijozat bersangiz, Bosqich 1 boyicha loyihaning asosiy fayllari kodi va konfiguratsiyalarini ketma-ket va izchil yozishni boshlayman.
