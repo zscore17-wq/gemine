@@ -1,0 +1,207 @@
+# PRODUCTION INCIDENT INVESTIGATION REPORT
+
+**Tizim:** Telegram Bot + Mini App + FastAPI + SQLAlchemy + PostgreSQL
+
+**Hodisa turi:** Race Condition, Data Inconsistency (Pul yechilib Premium berilmasligi va takroriy xarid)
+
+**Tahlilchi:** Senior Backend Engineer / Systems Architect
+
+---
+
+## 1. LOGLAR VA HODISA TAHLILI (INCIDENT BREAKDOWN)
+
+Loglardan ko'rinib turgan jaraynining ketma-ketligi:
+
+1. **20:15:01** — `user=105` uchun bir vaqtning o'zida ikkita alohida xarid so'rovi (Req A va Req B) yetib kelgan (`purchase_started`).
+2. **20:15:02** — Ikkala so'rov ham bir vaqtda PostgreSQL'dan foydalanuvchi balansini o'qigan: `balance = 50000`.
+3. **20:15:02** — Ikkala oqim (thread/process) ham Python xotirasida `50000 - 30000 = 20000` hisoblab, bazaga `balance = 20000` qiymatini yozgan (`Lost Update`).
+4. **20:15:03** — So'rovlardan biri `purchases` jadvaliga `transaction_id` yozmoqchi bo'lganda `IntegrityError: UNIQUE constraint failed` xatosi bilan to'xtagan. Ikkinchisi esa `purchase_success` qaytargan.
+
+---
+
+## 2. SHUBHALI KODDAGI STRUKTURAVIY XATOLAR
+
+Berilgan `purchase` funksiyasida **3 ta kritik arxitektura xatosi** mavjud:
+
+```python
+# XATO 1: Row-level lock yo'q (Race condition manbai)
+user = db.query(User).filter(User.id == user_id).first() 
+
+# XATO 2: Ikki bosqichli Commit (Two-Commit Anti-Pattern)
+db.add(purchase)
+db.commit() # <--- 1-COMMIT: Balans ayroqlangan, Purchase yozilgan!
+
+user.is_premium = True
+user.premium_expires_at = datetime.now() + timedelta(days=30)
+db.commit() # <--- 2-COMMIT: Premium beriladi
+
+```
+
+---
+
+## 3. AUDIT SAVOL-JAVOBLARI (DETAILED FINDINGS)
+
+### 1. Loglarda qanday race condition sodir bo‘lgan?
+
+Loglarda **TOCTOU (Time-of-Check to Time-of-Use)** va **Lost Update (Yo'qotilgan yangilanish)** turidagi poyga holati yuz bergan. Ikkala so'rov bir vaqtda balansni (`50000`) o'qigan. Ikkalasi ham parallel ravishda xotirada `50000 - 30000 = 20000` hisoblab, bir-birining ortidan bazaga `20000` yozgan. Natijada foydalanuvchidan 2 ta xarid uchun 60,000 emas, faqat 30,000 yechilgan.
+
+### 2. Bir xil `transaction_id` bilan kelgan ikki so‘rov qanday natijaga olib keladi?
+
+* **Req A (Birinchi yetib kelgan):** Balansni `20000` qiladi, `Purchase` obyektini qo'shadi, **1-commit**'ni bajaradi. Keyin `is_premium = True` qilib, **2-commit**'ni bajaradi va `{"success": True}` qaytaradi.
+* **Req B (Ikkinchi yetib kelgan):** Balansni u ham `20000` qilib yozadi, lekin **1-commit** vaqtida PostgreSQL `purchases.transaction_id` bo'yicha `UNIQUE constraint` sababli `IntegrityError` otadi. Req B halokatli to'xtaydi (crash).
+
+### 3. Birinchi `commit()` muvaffaqiyatli, ikkinchisi muvaffaqiyatsiz bo‘lsa, DB'da qanday holat qoladi?
+
+**Eng xavfli holat yuzaga keladi:**
+
+* **1-commit** allaqachon PostgreSQL diskiga yozib bo'lingan: Balansdan pul yechilgan (`balance = 20000`) va `purchases` jadvalida yozuv paydo bo'lgan.
+* Agar 1-commit va 2-commit oralig'ida xatolik yuz bersa (masalan, `IntegrityError`, server o'chishi, tarmoq uzilishi), **2-commit hech qachon bajarilmaydi**.
+* **DB'dagi holat:** Balans kamaygan, lekin `user.is_premium` hali ham `False` va `premium_expires_at` `None` bo'lib qoladi.
+
+### 4. Balansni ikki marta yechish, Premium bermaslik va noto‘g‘ri muvaffaqiyat javobi qanday yuzaga keladi?
+
+* **Premium bermaslik:** 1-commit muvaffaqiyatli o'tib, 2-commit'gacha bo'lgan masofada dastur xatolikka uchraganda (3-savol).
+* **Balansni ikki marta yechish:** Agar so'rovlar har xil `transaction_id` bilan kelsa va birinchi so'rov 1-commit'ni tugatgandan so'ng ikkinchisi balansni o'qisa (50k -> 20k -> -10k), yoki foydalanuvchi "pulim yechildi lekin premium berilmadi" deb qayta xarid tugmasini bossa.
+* **Noto'g'ri muvaffaqiyat javobi (False Success):** Admin panel `purchases` jadvaliga qarab "xarid muvaffaqiyatli" deydi (chunki 1-commit yozilgan), lekin foydalanuvchida `is_premium = False` bo'ladi (chunki 2-commit bajarilmagan).
+
+### 5. Texnik mexanizmlarning farqlari
+
+| Mexanizm | Vzifasi va Muhimligi |
+| --- | --- |
+| **SQL Transaction** | ACID tamoyilini ta'minlaydi. Barcha operatsiyalar (balans kamaytirish, purchase yaratish, premium berish) **yagona atomar blokda** bajarilishini kafolatlaydi. Birortasi xato bersa, barchasi `ROLLBACK` bo'ladi. |
+| **Row-Level Locking (`FOR UPDATE`)** | Parallel so'rovlar bir xil `User` qatorini bir vaqtda o'qib-yozishini taqiqlaydi. Birinchi so'rov tranzaksiyani tugatmaguncha ikkinchi so'rov kutib turadi. |
+| **Idempotency** | Bir xil so'rov (bir xil `transaction_id`) bir necha bor kelganda, tizim takroriy nojo'ya ta'sirlarsiz (double-spend) bir xil xavfsiz natijani qaytarishini ta'minlaydi. |
+| **UNIQUE Constraint** | Ma'lumotlar bazasi sxemasi darajasidagi oxirgi himoya chizig'i. Baza darajasida takroriy `transaction_id` kirishini taqiqlaydi. |
+
+---
+
+### 6. POSTGRESQL UCHUN XAVFSIZ PURCHASE ARXITEKTURASI (REF ACTORED CODE)
+
+```python
+from datetime import datetime, timedelta, timezone
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from fastapi import HTTPException, status
+
+def purchase_safe(user_id: int, price: int, transaction_id: str, db: Session) -> dict:
+    """
+    Atomar, Idempotent va Row-Level Lock bilan himoyalangan xarid funksiyasi.
+    """
+    try:
+        # 1. IDEMPOTENCY CHECK: Tranzaksiya ilgari bajarilganini tekshirish
+        existing_purchase = db.query(Purchase).filter(
+            Purchase.transaction_id == transaction_id
+        ).first()
+
+        if existing_purchase:
+            return {
+                "success": True, 
+                "message": "Transaction already processed", 
+                "already_processed": True
+            }
+
+        # 2. ROW-LEVEL LOCKING: User qatorini bloklaymiz (Pessimistic Lock)
+        # Boshqa parallel so'rovlar shu qator bo'yicha ushbu tranzaksiya tugaguncha kutadi.
+        user = db.query(User).filter(
+            User.id == user_id
+        ).with_for_update().first()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # 3. BALANS VA SHARTLAR TEKSHIRUVI
+        if user.balance < price:
+            return {"success": False, "reason": "Insufficient balance"}
+
+        # 4. BARCHA O'ZGARISHLARNI XOTIRADA BAJARISH (YAGONA TRANZAKSIYA)
+        user.balance -= price
+        user.is_premium = True
+        
+        now = datetime.now(timezone.utc)
+        if user.premium_expires_at and user.premium_expires_at > now:
+            user.premium_expires_at += timedelta(days=30)
+        else:
+            user.premium_expires_at = now + timedelta(days=30)
+
+        purchase_record = Purchase(
+            user_id=user_id,
+            transaction_id=transaction_id
+        )
+        db.add(purchase_record)
+
+        # 5. YAGONA ATOMAR COMMIT
+        db.commit()
+        return {"success": True}
+
+    except IntegrityError:
+        # DB level UNIQUE constraint urilganda (Parallel idempotency fallback)
+        db.rollback()
+        return {
+            "success": True, 
+            "message": "Concurrent duplicate request handled", 
+            "already_processed": True
+        }
+    except Exception as e:
+        db.rollback()
+        raise e
+
+```
+
+---
+
+### 7. Xatolik yuz berganda Rollback va Retry qanday ishlashi kerak?
+
+* **Rollback:** Har qanday unhandled exception yoki `IntegrityError` yuz berganda `db.rollback()` chaqirilishi shart. Bu DB holatini so'rovgacha bo'lgan toza holatiga qaytaradi.
+* **Retry Mexanizmi:** DB Deadlock (`OperationalError`) yuz berganda application darajasida Exponential Backoff bilan 3 marta qayta urinish (retry) funksiyasi qo'shiladi. `IntegrityError` (Unique violation) yuz berganda esa retry qilinmaydi, chunki bu takroriy so'rov hisoblanadi.
+
+---
+
+### 8. 10 ta parallel bir xil transaction so'rovi kelganda nima bo'ladi?
+
+1. Birinchi so'rov (Req 1) `with_for_update()` orqali `User` qatoriga **Pessimistic Lock** qo'yadi.
+2. Qolgan 9 ta so'rov (Req 2..10) DB darajasida bloklanadi va Req 1 tranzaksiyasi tugashini kutadi.
+3. Req 1 balansi yechadi, `Purchase` yaratadi, Premium beradi va **bitta commit** qiladi. Lock yechiladi.
+4. Qolgan 9 ta so mezon ketma-ket lockni oladi, lekin birinchi bo'lib `Purchase.transaction_id == transaction_id` mavjudligini ko'rib, hechnarsa o'zgartirmasdan `already_processed: True` bilan darhol qaytadi.
+5. **Natijada:** Balans faqat 1 marta yechiladi, 1 ta yozuv yoziladi, 1 marta Premium beriladi.
+
+---
+
+### 9. TESTLAR REJASI (TESTING PLAN)
+
+#### A. Unit Tests
+
+* Balans yetarli bo'lmaganda `success: False` qaytishini tekshirish.
+* Muvaffaqiyatli xaridda `premium_expires_at` to'g'ri 30 kunga surilishini tekshirish.
+
+#### B. Integration Tests
+
+* Baza darajasida atomar `commit` va `rollback` ishlashini tekshirish.
+* Bir xil `transaction_id` bilan ketma-ket 2 marta so'rov yuborilganda ikkinchisi idempotency bilan qaytishini tekshirish.
+
+#### C. Concurrency Tests (Locust / `asyncio.gather`)
+
+* `asyncio.gather` yordamida bir vaqtning o'zida bir xil user va bir xil `transaction_id` bilan **10 ta parallel HTTP POST** so'rovi yuborish.
+* **Verifikatsiya:**
+* `purchases` jadvalida yozuvlar soni **aniq 1 ta**.
+* Foydalanuvchi balansi **aniq 1 marta** kamaygan.
+* DB'da hech qanday poyga xatosi yoki lock-conflict bo'lmagan.
+
+
+
+---
+
+### 10. Loglardan bilish mumkin bo'lgan faktlar vs DB Tekshiruvi
+
+| Faktlar (Loglardan isbotlangan) | Noma'lumlar (DB audit talab qiladi) |
+| --- | --- |
+| 1. Parallel so'rovlar bir vaqtda kelgan va bir xil balansni o'qigan. | 1. Balansidan pul yechilib, Premium berilmagan foydalanuvchilarning aniq ro'yxati. |
+| 2. `Lost Update` yuz bergan (ikkala so'rov ham 20,000 yozgan). | 2. `purchases` jadvalida saqlanib qolgan yetim (orphaned) tranzaksiyalar soni. |
+| 3. Bir so'rov `IntegrityError` bilan qulagan, ikkinchisi o'tgan. | 3. Server va DB soatlari o'rtasidagi vaqt mintaqasi (timezone) farqlari. |
+
+---
+
+## 4. YAKUNIY VERDIKT (PRODUCTION READINESS)
+
+**XULOSA: TIZIM HOZIRGI HOLATIDA PRODUCTION'GA TAYYOR EMAS (CRITICAL RISK).**
+
+Tizimda atomar tranzaksiya va row-level lock mavjud emasligi sababli moliyaviy va ma'lumotlar yaxlitligi yo'qolishi xavfi o'ta yuqori. Yuqorida keltirilgan `purchase_safe` refaktoring kodi va tranzaksion arxitektura joriy etilib, Concurrency testlaridan o'tgandan so'nggina production muhitiga chiqarish tavsiya etiladi.
