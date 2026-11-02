@@ -1,0 +1,79 @@
+Mustaqil texnik tekshiruvda bildirilgan uchala e'tiroz ham **to'liq o'rinli va texnik jihatdan to'g'ri**. Oldingi audit hisobotida koddagi mantiqiy oqim va freymvork mexanizmlari yuzaki baholangan hamda ayrim oqibatlar oshirib ko'rsatilgan.
+
+Har bir e'tiroz bo'yicha batafsil texnik tahlil va to'g'rilangan xulosalar quyidagicha:
+
+---
+
+## 1. E'tirozlarni mustaqil texnik tekshirish
+
+### 1-e'tiroz: FastAPI va `db: Session` parametri
+
+* **Status:** **To'g'ri (E'tiroz to'liq qabul qilinadi)**.
+* **Texnik tahlil:** FastAPI yo'nalishlarni (`routes`) ro'yxatdan o'tkazish va OpenAPI sxemasini yaratish bosqichida har bir funksiya parametrining tipini Pydantic orqali tahlil qiladi. `sqlalchemy.orm.Session` bu Pydantic tayanch tipi hamda JSON-serializatsiya bo'ladigan oddiy tip emas.
+* **To'g'rilangan xulosa:** `db: Session` parametiriga `Depends()` berilmaganda, xatolik HTTP 422 runtime so'rovida emas, balki **ilova ishga tushayotgan vaqtda (startup phase)** yuz beradi. FastAPI Pydantic sxemasini qura olmay, `FastAPIError` / `PydanticUserError` otadi va dastur umuman ishga tushmaydi (`startup crash`).
+
+### 2-e'tiroz: Race Condition va Balans holati (Lost Update vs Negative Balance)
+
+* **Status:** **To'g'ri (E'tiroz to'liq qabul qilinadi)**.
+* **Texnik tahlil:** Kodda balansni kamaytirish SQL darajasida atomar (`UPDATE users SET balance = balance - price`) emas, balki Python xotirasidagi ORM obyekti ustida bajarilgan:
+```python
+user.balance -= price  # Python xotirasida: new_balance = user.balance - price
+
+```
+
+
+Ikki parallel so'rov (Thread A va Thread B) bir vaqtda kirganda:
+1. Thread A bazadan `balance = 100` ni o'qiydi va Python'da `100 - 100 = 0` hisoblaydi.
+2. Thread B ham parallel ravishda bazadan `balance = 100` ni o'qiydi va `100 - 100 = 0` hisoblaydi.
+3. Thread A bazaga `UPDATE users SET balance = 0 ...` yuboradi va `commit` qiladi.
+4. Thread B ham bazaga `UPDATE users SET balance = 0 ...` yuboradi va `commit` qiladi.
+
+
+* **To'g'rilangan xulosa:** Balans manfiyga (`-100`) tushmaydi. Bu yerda **Lost Update** (Yo'qotilgan yangilanish) anomaliyasi yuz beradi: Baza balansi `0` bo'lib qoladi, lekin tizimda 2 ta alohida xarid tranzaksiyasi (yoki muddat uzayishi) qayd etiladi. Foydalanuvchi bitta xarajat evaziga ikki barobar ko'p xizmat oladi.
+
+### 3-e'tiroz: IDOR va Xarid manbaa mantiqi
+
+* **Status:** **To'g'ri (E'tiroz to'liq qabul qilinadi)**.
+* **Texnik tahlil:** Koddagi mantiqni qadamma-qadam kuzatamiz:
+```python
+@app.post("/purchase/{user_id}")
+def purchase(user_id: int, price: int, db: Session):
+    user = db.query(User).filter(User.id == user_id).first()
+    # ...
+    user.balance -= price
+    user.is_premium = True
+
+```
+
+
+Hujumchi `user_id = 456` (Jabrlanuvchi ID'si) deb so'rov yuborsa, ORM bazadan `456` ID'li foydalanuvchini oladi. Balans ham `456` ning balansidan ayriladi va Premium ham aynan `456` ID'li foydalanuvchining o'ziga beriladi.
+* **To'g'rilangan xulosa:** Hujumchi o'z hisobiga Premium ololmaydi. Zaiflikning real oqibati — **boshqa foydalanuvchining hisobini ruxsatsiz boshqarish (Griefing Attack)**: hujumchi jabrlanuvchining ruxsatisiz uning balansini ishlatib yuborishi yoki unga majburiy Premium sotib olib berishi mumkin. Oldingi hisobotdagi "hujumchi o'ziga Premium oladi" degan xulosa koddagi mantiqqa mutloq zid edi.
+
+---
+
+## 2. Qayta ko'rilgan va to'g'rilangan audit hisoboti
+
+### A. Tasdiqlangan faktlar (Faqat taqdim etilgan koddan kelib chiquvchi)
+
+1. **Sintaktik to'xtash (`Startup Crash`):** `Base` import qilinmagani (`NameError`) va `db: Session` `Depends()`'siz berilgani sababli ilova ishga tushmaydi.
+2. **Unhandled Exception (`HTTP 500`):** `profile()` endpointida `user = None` bo'lganda `user.id` o'qilishi `AttributeError` beradi va server HTTP 500 qaytaradi.
+3. **Mantiqiy xato:** `premium_expires_at` `None` bo'lganda `str(None)` bajarilib, JSON'da `"None"` matni qaytadi.
+4. **Validatsiya yo'qligi:** `days` va `price` uchun manfiy qiymatlarni taqiqlovchi mantiq mavjud emas.
+5. **Autentifikatsiya yo'qligi:** `/admin/` va `/purchase/` endpointlarida so'rov yuboruvchining shaxsi ham, adminlik huquqi ham tekshirilmaydi.
+
+### B. Tashqi konfiguratsiyaga bog'liq holatlar (Noma'lumlar)
+
+* **PostgreSQL Isolation Level:** Agar baza tranzaksiyalari `Serializable` rejimida ishlasa, poyga holatida (Race Condition) ikkinchi tranzaksiya `Lost Update` o'rniga `Serialization Failure` xatosi bilan bekor qilinishi (rollback) mumkin.
+* **Tashqi Gateway / Proxy Auth:** FastAPI ilovasi oldida API Gateway (masalan, Nginx yoki Traefik) bor-yo'qligi va u autentifikatsiyani tekshirayotgani noma'lum.
+
+---
+
+## 3. Qayta baholash va noaniqliklar deklaratsiyasi
+
+| Audit xulosasi | Ishonch darajasi | Izoh / Qolgan noaniqlik |
+| --- | --- | --- |
+| `Base` yo'qligi va `Depends()` ishlatilmagani ilovani to'xtatishi | **100% Konkret** | Python va FastAPI sintaksisi hamda freymvork arxitekturasidan kelib chiqadigan qat'iy fakt. |
+| `profile()` endpointidagi HTTP 500 | **100% Konkret** | Topilmagan ob'ektdan attribute o'qish Python'da istisnosiz `AttributeError` otadi. |
+| IDOR orqali jabrlanuvchi balansini sarflash | **100% Konkret** | Koddagi `user` o'zgaruvchisi URL parametri bilan bog'langani aniq ko'rinib turibdi. |
+| Race Condition natijasida Lost Update yuz berishi | **85% Shartli** | Agarda PostgreSQL standart `Read Committed` izolyatsiya darajasida bo'lsa `Lost Update` yuz beradi. Baza `Serializable` rejimiga o'tkazilgan bo'lsa, xatti-harakat o'zgaradi. |
+| Manfiy `price` orqali balansni ko'paytirish | **90% Shartli** | Pydantic model yo'qligi sababli manfiy son o'tadi, lekin SQLAlchemy ustunida `CHECK (balance >= 0)` cheklovi bo'lsa, DB darajasida error berishi mumkin. |
