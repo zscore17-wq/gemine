@@ -1,0 +1,483 @@
+# PRODUCTION-GRADE SECURE PURCHASE SYSTEM ARCHITECTURE
+
+Ushbu loyihaviy yechim PostgreSQL va SQLAlchemy bazasida moliyaviy va obuna tranzaksiyalarining xavfsizligini, race condition hamda poyga holatlaridan to'liq muhofaza qilinishini ta'minlaydi.
+
+---
+
+## 1. ARXITEKTURA VA DATABASE SXEMASI (POSTGRESQL DDL)
+
+Tizim uchta asosiy ustunga tayanadi:
+
+1. **CHECK Constraint** — DB darajasida balans manfiyga tushishini taqiqlash.
+2. **TIMESTAMPTZ (UTC)** — Barcha vaqt qiymatlarini vaqt mintaqasi bilan (Timezone-Aware UTC) saqlash.
+3. **Idempotency Table & Unique Constraint** — Har bir xarid amalining takrorlanmasligini va bir xil idempotency kalitining foydalanuvchi doirasida izolyatsiyasini kafolatlash.
+
+```sql
+-- 1. Users jadvali
+CREATE TABLE users (
+    id BIGSERIAL PRIMARY KEY,
+    telegram_id VARCHAR(64) NOT NULL UNIQUE,
+    balance BIGINT NOT NULL DEFAULT 0 CHECK (balance >= 0),
+    is_premium BOOLEAN NOT NULL DEFAULT FALSE,
+    premium_expires_at TIMESTAMPTZ NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. Idempotent Purchases jadvali
+CREATE TABLE purchases (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    idempotency_key VARCHAR(128) NOT NULL,
+    price BIGINT NOT NULL CHECK (price > 0),
+    status VARCHAR(20) NOT NULL CHECK (status IN ('PROCESSING', 'COMPLETED', 'FAILED')),
+    response_payload JSONB NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    
+    -- Takroriy idempotency kalitining bir foydalanuvchi doirasida izolyatsiyasi
+    CONSTRAINT uq_user_idempotency UNIQUE (user_id, idempotency_key)
+);
+
+-- Baza samaradorligini oshirish uchun indekslar
+CREATE INDEX idx_purchases_user_idempotency ON purchases(user_id, idempotency_key);
+CREATE INDEX idx_users_telegram_id ON users(telegram_id);
+
+```
+
+---
+
+## 2. TO'LIQ KOD (SQLALCHEMY MODELS, SERVICE & RETRY HANDLER)
+
+### `models.py`
+
+```python
+from datetime import datetime, timezone
+from sqlalchemy import (
+    Column, BigInteger, Boolean, DateTime, String, JSON, CheckConstraint, UniqueConstraint, ForeignKey
+)
+from sqlalchemy.orm import declarative_base, relationship
+
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    telegram_id = Column(String(64), nullable=False, unique=True, index=True)
+    balance = Column(BigInteger, nullable=False, default=0)
+    is_premium = Column(Boolean, nullable=False, default=False)
+    premium_expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        CheckConstraint("balance >= 0", name="check_user_balance_non_negative"),
+    )
+
+class Purchase(Base):
+    __tablename__ = "purchases"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    idempotency_key = Column(String(128), nullable=False)
+    price = Column(BigInteger, nullable=False)
+    status = Column(String(20), nullable=False, default="PROCESSING")
+    response_payload = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_user_idempotency"),
+        CheckConstraint("price > 0", name="check_purchase_price_positive"),
+        CheckConstraint("status IN ('PROCESSING', 'COMPLETED', 'FAILED')", name="check_purchase_status_valid"),
+    )
+
+```
+
+### `schemas.py` & `exceptions.py`
+
+```python
+from pydantic import BaseModel, Field
+
+class PurchaseRequest(BaseModel):
+    user_id: int = Field(gt=0, description="Foydalanuvchi ID si musbat bo'lishi shart")
+    price: int = Field(gt=0, description="Xarid narxi 0 dan katta bo'lishi shart")
+    idempotency_key: str = Field(min_length=8, max_length=128, description="Unikal idempotency kaliti")
+
+class TransactionProcessingError(Exception):
+    """Parallel so'rov hali bajarilayotganda otiladigan istisno"""
+    pass
+
+```
+
+### `service.py`
+
+```python
+import time
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError, IntegrityError
+from fastapi import HTTPException, status
+
+from models import User, Purchase
+from schemas import PurchaseRequest, TransactionProcessingError
+
+def retry_on_db_lock(retries=3, backoff_factor=0.1):
+    """
+    Deadlock (40P01) yoki Serialization Failure (40001) yuzaga kelganda
+    Exponential Backoff bilan qayta urinish dekoratori.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(retries):
+                try:
+                    return func(*args, **kwargs)
+                except OperationalError as e:
+                    orig_code = getattr(e.orig, "pgcode", None)
+                    if orig_code in ("40P01", "40001") and attempt < retries - 1:
+                        time.sleep(backoff_factor * (2 ** attempt))
+                        continue
+                    raise
+        return wrapper
+    return decorator
+
+
+@retry_on_db_lock(retries=3, backoff_factor=0.1)
+def execute_purchase(db: Session, req: PurchaseRequest) -> dict:
+    """
+    Atmik, Idempotent va Row-Level Lock bilan himoyalangan xarid funksiyasi.
+    """
+    # 1. IDEMPOTENCY KEY CHECK & LOCK
+    # Idempotency yozuvini blokirovka bilan o'qiymiz
+    existing_purchase = db.query(Purchase).filter(
+        Purchase.user_id == req.user_id,
+        Purchase.idempotency_key == req.idempotency_key
+    ).with_for_update().first()
+
+    if existing_purchase:
+        if existing_purchase.status == "COMPLETED":
+            return existing_purchase.response_payload
+        elif existing_purchase.status == "PROCESSING":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Ushbu tranzaksiya hozirda boshqa oqim tomonidan bajarilmoqda. Birozdan so'ng qayta urinib ko'ring."
+            )
+        elif existing_purchase.status == "FAILED":
+            return existing_purchase.response_payload
+
+    # 2. Yangi Idempotency yozuvini 'PROCESSING' holatida yaratamiz
+    new_purchase = Purchase(
+        user_id=req.user_id,
+        idempotency_key=req.idempotency_key,
+        price=req.price,
+        status="PROCESSING"
+    )
+    
+    try:
+        db.add(new_purchase)
+        db.flush()  # DB Unique Constraint tekshiruvidan o'tkazamiz
+    except IntegrityError:
+        db.rollback()
+        # Parallel so'rov soniya ichida yozuvni kiritingan bo'lsa, uni qayta o'qiymiz
+        retry_record = db.query(Purchase).filter(
+            Purchase.user_id == req.user_id,
+            Purchase.idempotency_key == req.idempotency_key
+        ).with_for_update().first()
+        
+        if retry_record and retry_record.status == "COMPLETED":
+            return retry_record.response_payload
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Parallel so'rovlar to'qnashuvi yuz berdi."
+        )
+
+    # 3. USER ROW-LEVEL LOCKING (SELECT ... FOR UPDATE)
+    user = db.query(User).filter(User.id == req.user_id).with_for_update().first()
+
+    if not user:
+        result_payload = {"success": False, "reason": "User not found"}
+        new_purchase.status = "FAILED"
+        new_purchase.response_payload = result_payload
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Foydalanuvchi topilmadi")
+
+    # 4. BALANS TEKSHIRUVI
+    if user.balance < req.price:
+        result_payload = {"success": False, "reason": "Insufficient balance"}
+        new_purchase.status = "FAILED"
+        new_purchase.response_payload = result_payload
+        db.commit()
+        return result_payload
+
+    # 5. ATOMAR MOLIYAVIY VA OBUNA AMALLARI (UTC POLICY)
+    user.balance -= req.price
+    user.is_premium = True
+
+    now_utc = datetime.now(timezone.utc)
+    if user.premium_expires_at and user.premium_expires_at > now_utc:
+        user.premium_expires_at += timedelta(days=30)
+    else:
+        user.premium_expires_at = now_utc + timedelta(days=30)
+
+    # 6. TRANZAKSIYANI YAKUNLASH VA MUVAFFAQIYATLI JAVOBNI SAQLASH
+    result_payload = {
+        "success": True,
+        "new_balance": user.balance,
+        "premium_expires_at": user.premium_expires_at.isoformat(),
+        "idempotency_key": req.idempotency_key
+    }
+    
+    new_purchase.status = "COMPLETED"
+    new_purchase.response_payload = result_payload
+
+    # Yagona atomar commit
+    db.commit()
+    return result_payload
+
+```
+
+---
+
+## 3. POSTGRESQL CONSTRAINT VA INDEXLARNING VAZIFASI
+
+* `CHECK (balance >= 0)`: SQLAlchemy yoki Python kodi darajasidagi xatolik sababli manfiy balans yozilishiga urinish bo'lsa, PostgreSQL ushbu amaldan voz kechadi (`CheckViolation`).
+* `UNIQUE (user_id, idempotency_key)`:
+* **Sohaviy izolyatsiya**: `User A` ishlatgan `TX_100` kalitini `User B` ham ishlatishi mumkin. Idempotency kaliti foydalanuvchi ID si bilan birgalikda unikal bo'ladi.
+* **To'qnashuvdan himoya**: Har xil foydalanuvchilar bir xil `transaction_id` yuborganda, nohaq to'xtashlar (false collisions) yuzaga kelmaydi.
+
+
+* `TIMESTAMPTZ`: Barcha vaqtlar UTC bo'yicha saqlanadi. Server local timezone'i qanday bo'lishidan qat'i nazar, `datetime.now(timezone.utc)` bilan solishtirish aniq va xatosiz ishlaydi.
+
+---
+
+## 4. IDEMPOTENCY ALGORITMI CHIZMASI
+
+```
+                  [So'rov kelib tushdi]
+                            │
+               [Input Validation: price > 0]
+                            │
+        [SELECT * FROM purchases WHERE user_id AND key FOR UPDATE]
+                            │
+            ┌───────────────┴───────────────┐
+      [Yozuv Mavjud]                  [Yozuv Yo'q]
+            │                               │
+   ┌────────┴────────┐            [INSERT 'PROCESSING' Status]
+[COMPLETED]     [PROCESSING]                │
+   │                 │             [SELECT * FROM users FOR UPDATE]
+[Natijani        [HTTP 409                  │
+ qaytarish]      Conflict]          [Balans yetarlimi?]
+                                            │
+                                 ┌──────────┴──────────┐
+                               [HA]                   [YO'Q]
+                                 │                      │
+                       [Balansni kamaytirish    [Status = 'FAILED'
+                        Premium vaqtini uzaytirish  Commit & Return
+                        Status = 'COMPLETED']    Insufficient balance]
+                                 │
+                           [COMMIT DB]
+
+```
+
+---
+
+## 5. XATOLARNI QAYTA ISHLASH VA RETRY STRATEGIYASI
+
+* **Deadlock / Serialization Failure (`40P01`, `40001`)**: `@retry_on_db_lock` dekoratori orqali tranzaksiya avtomatik ravishda 3 marta exponential backoff (`0.1s`, `0.2s`, `0.4s`) bilan qayta urinib ko'riladi.
+* **Timeout / Unknown Commit State**:
+* Agar mijoz va server o'rtasidagi tarmoq `commit()` bajarilgandan so'ng uzilib qolsa va mijoz javob ololmasdan qayta so'rov yuborsa:
+* Qayta yuborilgan so'rov `Purchase.status == 'COMPLETED'` ekanligini ko'radi va bazadagi baland va obunaga **qayta tegmasdan**, avvalgi saqlangan `response_payload` natijasini darhol qaytaradi.
+
+
+
+---
+
+## 6. UNIT TESTLAR (PYTEST)
+
+> **DIQQAT:** Ushbu testlar avtonom test muhitida (pytest) bajarilishi uchun tayyorlangan koddir.
+> Testlarni o'zingizning lokal dev-muhitida ishga tushirish buyrug'i: `pytest test_purchase.py`
+
+```python
+# test_purchase.py
+import pytest
+from unittest.mock import MagicMock
+from fastapi import HTTPException
+from pydantic import ValidationError
+
+from schemas import PurchaseRequest
+from service import execute_purchase
+
+def test_purchase_request_validation_negative_price():
+    """Manfiy narx kelganda Pydantic validatsiyasi xatolik berishini tekshirish"""
+    with pytest.raises(ValidationError):
+        PurchaseRequest(user_id=1, price=-5000, idempotency_key="tx_valid_123")
+
+def test_purchase_request_validation_zero_user_id():
+    """User ID 0 bo'lganda validatsiya xatosi berishi"""
+    with pytest.raises(ValidationError):
+        PurchaseRequest(user_id=0, price=1000, idempotency_key="tx_valid_123")
+
+def test_purchase_user_not_found(mocker):
+    """Foydalanuvchi bazada topilmaganda HTTP 404 qaytarishi"""
+    db_mock = MagicMock()
+    # Existing purchase query returns None
+    db_mock.query().filter().with_for_update().first.side_effect = [None, None]
+    
+    req = PurchaseRequest(user_id=999, price=1000, idempotency_key="tx_not_found_123")
+    
+    with pytest.raises(HTTPException) as exc_info:
+        execute_purchase(db_mock, req)
+    
+    assert exc_info.value.status_code == 404
+
+```
+
+---
+
+## 7. POSTGRESQL INTEGRATION TESTLAR
+
+Real PostgreSQL bazasi va SQLAlchemy Session bilan ishlashini tekshirish uchun testlar:
+
+```python
+# test_integration.py
+import pytest
+from datetime import datetime, timezone
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from models import Base, User, Purchase
+from schemas import PurchaseRequest
+from service import execute_purchase
+
+TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/test_db"
+
+@pytest.fixture(scope="module")
+def db_engine():
+    engine = create_engine(TEST_DATABASE_URL)
+    Base.metadata.create_all(bind=engine)
+    yield engine
+    Base.metadata.drop_all(bind=engine)
+
+@pytest.fixture
+def db_session(db_engine):
+    connection = db_engine.connect()
+    transaction = connection.begin()
+    session = sessionmaker(bind=connection)()
+
+    yield session
+
+    session.close()
+    transaction.rollback()
+    connection.close()
+
+def test_successful_purchase_flow(db_session):
+    # Setup test user
+    user = User(telegram_id="tg_12345", balance=50000, is_premium=False)
+    db_session.add(user)
+    db_session.commit()
+
+    req = PurchaseRequest(user_id=user.id, price=20000, idempotency_key="tx_unique_001")
+    res = execute_purchase(db_session, req)
+
+    assert res["success"] is True
+    assert res["new_balance"] == 30000
+    
+    # DB holatini qayta tekshiramiz
+    updated_user = db_session.query(User).get(user.id)
+    assert updated_user.balance == 30000
+    assert updated_user.is_premium is True
+    assert updated_user.premium_expires_at > datetime.now(timezone.utc)
+
+```
+
+---
+
+## 8. 10 TA PARALLEL SO'ROV UCHUN CONCURRENCY TEST
+
+Ushbu test bir xil foydalanuvchi va bir xil idempotency kaliti bilan kelgan **10 ta parallel so'rovdan faqat 1 tasi bajarilishini** va balans **faqat 1 marta yechilishini** tasdiqlaydi.
+
+```python
+# test_concurrency.py
+import concurrent.futures
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from models import Base, User, Purchase
+from schemas import PurchaseRequest
+from service import execute_purchase
+
+DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/test_db"
+engine = create_engine(DATABASE_URL, pool_size=20, max_overflow=10)
+SessionLocal = sessionmaker(bind=engine)
+
+def run_parallel_purchase(user_id: int, key: str):
+    db = SessionLocal()
+    try:
+        req = PurchaseRequest(user_id=user_id, price=10000, idempotency_key=key)
+        return execute_purchase(db, req)
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+def test_ten_parallel_requests_single_execution():
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+
+    # User balansi = 50,000 (Faqat 1 ta xaridga yetadi deb hisoblasak ham)
+    init_db = SessionLocal()
+    user = User(telegram_id="tg_parallel", balance=50000)
+    init_db.add(user)
+    init_db.commit()
+    user_id = user.id
+    init_db.close()
+
+    idempotency_key = "parallel_tx_key_999"
+
+    # 10 ta oqim (thread) orqali parallel so'rov yuboramiz
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [
+            executor.submit(run_parallel_purchase, user_id, idempotency_key)
+            for _ in range(10)
+        ]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    # TEKSHIRUV
+    check_db = SessionLocal()
+    final_user = check_db.query(User).get(user_id)
+    purchases_count = check_db.query(Purchase).filter(
+        Purchase.user_id == user_id, 
+        Purchase.idempotency_key == idempotency_key
+    ).count()
+
+    # 1. Balans 50000 - 10000 = 40000 bo'lishi shart (Double spending bo'lmagan)
+    assert final_user.balance == 40000
+    # 2. Idempotency yozuvi bazada FAQAT 1 ta bo'lishi shart
+    assert purchases_count == 1
+    
+    check_db.close()
+
+```
+
+---
+
+## 9. TIMEOUT VA TAKRORIY SO'ROV SSENARIYLARI
+
+1. **Ssenariy: Bajarilayotgan Tranzaksiya (Status: 'PROCESSING')**
+* Parallel So'rov A kelib `PROCESSING` yozuvini yaratdi. So'rov B xuddi shu soniyada yetib kelganda `HTTP 409 Conflict` javobini oladi va kutish/retry rejimiga o'tadi.
+
+
+2. **Ssenariy: Muvaffaqiyatli Takroriy So'rov (Status: 'COMPLETED')**
+* So'rov A muvaffaqiyatli tugadi (`COMPLETED`). So'rov B 5 daqiqadan keyin xuddi shu `idempotency_key` bilan kelganda, baza statusini ko'rib, balansdan pul ayirmasdan, avval saqlab qo'yilgan JSON payloadni qaytaradi.
+
+
+
+---
+
+## 10. QOLGAN XAVFLAR VA PRODUCTION CHEKLOVLARI
+
+1. **PostgreSQL Connection Pool limitlari**: Yuqori yuklamada (High Throughput) `with_for_update()` qo'llanilganda ulanishlar navbatga turishi mumkin. SQLAlchemy Pool Size (`pool_size=20`, `max_overflow=20`) va PgBouncer integratsiyasi talab qilinadi.
+2. **Kesh Qatlami (Redis)**: Millionlab so'rovlar kelganda har bir idempotency tekshiruvi uchun PostgreSQL ga borish bazaga yuklama beradi. Idempotency statuslarini vaqtinchalik Redis keshiga yozish (Redis Distributed Lock) orqali bazaga tushayotgan yuklamani 80% ga kamaytirish mumkin.
