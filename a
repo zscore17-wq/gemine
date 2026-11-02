@@ -1,0 +1,182 @@
+# TEST 9 — FULL PROJECT ENGINEERING CHALLENGE
+
+Sen Senior Software Architect, Lead Backend Engineer va Full-Stack Developer sifatida ishlaysan.
+
+Vazifang — professional darajadagi Telegram Bot + Mini App platformasini noldan loyihalash va bosqichma-bosqich ishlab chiqish.
+
+Loyiha nomi: Serial Plus.
+
+## 1. Asosiy talab
+
+Bu oddiy Telegram bot bo‘lmasligi kerak. Bot va Mini App bir xil biznes imkoniyatlariga ega bo‘lgan yagona platformaning ikkita interfeysi bo‘lishi kerak.
+
+Barcha ma'lumotlar yagona backend va yagona ma'lumotlar bazasi orqali boshqariladi.
+
+## 2. Texnologiyalar
+
+Quyidagi texnologiyalarni asos sifatida ko‘rib chiq:
+
+- Python
+- aiogram
+- FastAPI
+- PostgreSQL
+- SQLAlchemy
+- HTML, CSS, JavaScript
+- Telegram Mini Apps API
+- Pytest
+- Docker
+
+Agar boshqa texnologiya zarur bo‘lsa, sababini tushuntir.
+
+## 3. Foydalanuvchi imkoniyatlari
+
+- Telegram orqali ro‘yxatdan o‘tish.
+- Seriallar katalogi.
+- Serial haqida batafsil ma'lumot.
+- Mavsum va epizodlar.
+- Bepul va pullik epizodlar.
+- To‘liq serial yoki alohida epizod sotib olish.
+- Premium obuna.
+- Foydalanuvchi profili.
+- Xaridlar tarixi.
+- Premium muddati va holati.
+- Majburiy kanal obunasini tekshirish.
+- Bot va Mini App orqali bir xil imkoniyatlardan foydalanish.
+
+## 4. Kontent boshqaruvi
+
+Kontent Telegram private storage kanallarida saqlanadi.
+
+Admin postni quyidagi formatda yuboradi:
+
+`#e1_1_1`
+
+Bu yerda:
+- e1 — serial kodi.
+- 1 — mavsum.
+- 1 — epizod.
+
+Tizim postni aniqlab, tegishli serial, mavsum va epizod bilan bog‘lashi kerak.
+
+Admin quyidagilarni bajara olishi kerak:
+- Storage kanal qo‘shish, tahrirlash va o‘chirish.
+- Kanalni tanlash.
+- Tarixiy postlarni to‘liq yoki diapazon bo‘yicha skanerlash.
+- Yangi postlarni avtomatik kuzatish.
+- Noto‘g‘ri formatlangan postlarni aniqlash.
+- Takroriy postlarni boshqarish.
+
+## 5. Premium va to‘lovlar
+
+Premium tariflari admin tomonidan boshqariladi.
+
+Boshlang‘ich tariflar:
+- 7 kun — 10 000 so‘m.
+- 30 kun — 30 000 so‘m.
+- 90 kun — 80 000 so‘m.
+
+Admin tariflarni o‘zgartira olishi kerak.
+
+Talablar:
+- Premiumni qo‘lda berish.
+- Premium muddatini avtomatik hisoblash.
+- Muddati tugaganda huquqlarni avtomatik bekor qilish.
+- Har bir serial uchun bepul epizodlar sonini belgilash.
+- Click va Payme integratsiyasiga tayyor arxitektura.
+- To‘lovlar uchun idempotency va tranzaksiya xavfsizligi.
+
+To‘lov provayderlari integratsiyasi keyingi bosqichda yoqilishi mumkin. Hozircha test va qo‘lda boshqariladigan rejim ishlashi kerak.
+
+## 6. Admin panel
+
+Professional boshqaruv paneli yarat.
+
+Unda:
+- Dashboard.
+- Foydalanuvchilar.
+- Seriallar.
+- Mavsumlar va epizodlar.
+- Storage kanallar.
+- Premium tariflari.
+- Xaridlar.
+- Daromad statistikasi.
+- Adminlar va rollar.
+- Foydalanuvchini bloklash.
+- Premium sovg‘a qilish.
+- Audit log.
+- Tizim sozlamalari.
+
+Oddiy foydalanuvchilar admin menyusi yoki admin interfeysini ko‘rmasligi kerak. Server barcha admin huquqlarini tekshirishi shart.
+
+## 7. Arxitektura va xavfsizlik
+
+- Telegram Mini App `initData` serverda tekshirilsin.
+- Client yuborgan user ID, narx yoki rolga ishonilmasin.
+- Bot va Mini App bitta business service qatlamidan foydalansin.
+- Xaridlar atomik transaction bilan bajarilsin.
+- Takroriy to‘lovlar ikki marta hisoblanmasin.
+- Ma'lumotlar bazasi migratsiyalari bo‘lsin.
+- Rate limiting va audit logging bo‘lsin.
+- Secretlar kodga yozilmasin.
+- Xatolar foydalanuvchiga maxfiy ma'lumotlarni oshkor qilmasin.
+
+## 8. Ishlab chiqish tartibi
+
+Ishni quyidagi bosqichlarda bajar:
+
+1. Talablar tahlili va noma'lum jihatlar.
+2. Arxitektura va ma'lumotlar bazasi modeli.
+3. Loyiha strukturasi.
+4. Backend va API.
+5. Telegram bot.
+6. Mini App.
+7. Admin panel.
+8. Testlar.
+9. Xavfsizlik auditi.
+10. Deployment va hujjatlar.
+
+Har bosqichdan keyin natijani tekshir. Oldingi bosqichdagi kritik xatolarni tuzatmasdan keyingisiga o'tma.
+
+## 9. Yetkazib berish talablari
+
+Yakuniy natija:
+- To‘liq loyiha manba kodi.
+- Barcha zarur fayllar.
+- `.env.example`.
+- Database migrations.
+- Testlar.
+- `requirements.txt` yoki mos dependency fayllari.
+- Docker konfiguratsiyasi.
+- Windows uchun ishga tushirish skripti.
+- Linux server uchun deployment yo‘riqnomasi.
+- README.
+- Admin va foydalanuvchi qo‘llanmasi.
+
+Kodlar bir-biriga mos va ishga tushadigan bo‘lishi shart.
+
+## 10. Qat'iy qoidalar
+
+- Mavjud bo‘lmagan faylni yaratdim deb aytma.
+- Ishlamagan kodni ishlaydi deb da'vo qilma.
+- Testlarni bajarmagan bo‘lsang, natijani to‘qima.
+- Muhim ma'lumot yetishmasa, savol ber.
+- Taxminlarni alohida belgilab qo‘y.
+- Kodni faqat qisqa namuna sifatida emas, haqiqiy loyiha komponenti sifatida yoz.
+- Juda katta loyihani bitta javobga siqishtirma.
+- Fayllarni izchil va to‘liq ishlab chiq.
+- Har bir bosqichda bajarilgan ishlar, qolgan ishlar va ma'lum muammolarni qayd et.
+
+## Birinchi javobing
+
+Hozircha kod yozishni boshlama.
+
+Avval:
+1. Talablarni tahlil qil.
+2. Qarama-qarshilik va yetishmayotgan ma'lumotlarni aniqlab ber.
+3. Professional arxitektura taklif qil.
+4. Database ER modelini ishlab chiq.
+5. Loyiha papkalari strukturasini ko‘rsat.
+6. Ishlab chiqish bosqichlari va qabul qilish mezonlarini yoz.
+7. Qaysi qismlarni avtomatlashtirish mumkinligini tushuntir.
+
+Faqat shundan keyin birinchi ishlab chiqish bosqichini boshlashga tayyor ekaningni bildir.
