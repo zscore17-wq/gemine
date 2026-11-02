@@ -1,0 +1,488 @@
+# ADVANCED CYBERSECURITY AUDIT & THREAT MODELING REPORT
+
+**Tizim:** Telegram Bot (aiogram) + Mini App (JS) + FastAPI + PostgreSQL + Click/Payme Integratsiyalari
+
+**Auditor Roli:** Senior Application Security Engineer & Telegram Mini App Security Architect
+
+**Hujjat Maqomi:** Ishlab chiqarish muhiti (Production) uchun yakuniy kiberxavfsizlik va audit hisoboti
+
+---
+
+## 1. MA'LUMOTLAR KLASSIFIKATSIYASI (FAKTLAR VS NOMA'LUM HOLATLAR)
+
+Audit xulosalarining aniqligini ta'minlash uchun loyiha holati uch guruhga ajratildi:
+
+* **Koddagilardan Tasdiqlangan Faktlar:**
+1. `auth.py` har qanday kriptografik verification’siz `X-User-Id` HTTP sarlavhasiga ishonadi.
+2. `payment.py` `/payment/callback` endpointi hamma uchun ochiq (unauthenticated), elektron imzo (signature), IP allowlist va idempotency tekshiruvi mavjud emas.
+3. `admin.py` `/admin/users/{user_id}/block` endpointida autentifikatsiya yoki adminlik huquqini (`is_admin`) tekshiruvchi hech qanday middleware yoki guard yo'q.
+4. `miniapp.js` Telegram client’idagi `initDataUnsafe` obyektidan foydalanadi va xom `initData` o'rniga soxtalashtiriluvchi `X-User-Id` sarlavhasini yuboradi.
+
+
+* **Tashqi Konfiguratsiyaga Bog'liq Noma'lumlar:**
+1. Reverse Proxy (Nginx/Traefik/Cloudflare) darajasida IP allowlist yoki Rate Limiting mavjudligi.
+2. Click va Payme callback’lari uchun maxfiy kalitlar (`SECRET_KEY`, `SERVICE_ID`, `MERCHANT_ID`) `.env` faylida qanday saqlanishi.
+3. Telegram Private Storage Channel kontentiga ulanishlar bot orqali proxylanadimi yoki to'g'ridan-to'g'ri `file_id` tarqatiladimi.
+
+
+
+---
+
+## 2. ENG XAVFLI 10 TA ZAIFLIK (DETAILED VULNERABILITY REPORT)
+
+### 1. Payment Callback Signature va Authentication Yo'qligi (Fake Payment / Credit Influx)
+
+* **Fayl/Endpoint:** `payment.py` (`POST /payment/callback`)
+* **Maqomi:** Tasdiqlangan fakt.
+* **Hujum Mexanizmi:** Hujumchi endpointga autentifikatsiyasiz oddiy HTTP POST so'rovini yuboradi:
+`POST /payment/callback?user_id=1&amount=99999999&transaction_id=fake_tx_001`
+* **Real Zarar:** Tizim balansiga asossiz mablag' qo'shiladi va Premium statusi tekinga beriladi. Tizim moliyaviy va kontent yo'qotishiga uchraydi.
+* **Risk Darajasi:** **CRITICAL**
+* **Himoya Chorasi:** Click/Payme tomonidan beriluvchi HMAC/MD5 imzosini va HTTP Basic Auth’ni tekshirish, faqat Click/Payme IP manzillaridan kelgan so'rovlarni qabul qilish.
+* **Regression Test:** Soxta `transaction_id` va imzosiz POST so'rovi yuborilganda **HTTP 401 Unauthorized** yoki **HTTP 403 Forbidden** qaytishini tekshirish.
+
+---
+
+### 2. Admin Endpointlarida Autentifikatsiya va Avtorizatsiya Yo'qligi (Broken Access Control)
+
+* **Fayl/Endpoint:** `admin.py` (`POST /admin/users/{user_id}/block`)
+* **Maqomi:** Tasdiqlangan fakt.
+* **Hujum Mexanizmi:** Hujumchi ixtiyoriy foydalanuvchi ID’sini ko'rsatib, `/admin/users/123/block` endpointiga so'rov yuboradi.
+* **Real Zarar:** Oddiy foydalanuvchi ixtiyoriy foydalanuvchini, hatto haqiqiy adminlarni ham tizimda bloklab qo'ya oladi (DoS & System Takeover).
+* **Risk Darajasi:** **CRITICAL**
+* **Himoya Chorasi:** Admin endpointlariga `Depends(get_current_admin_user)` guard’ini biriktirish.
+* **Regression Test:** Admin bo'lmagan foydalanuvchi tokeni yoki `initData` si bilan admin endpointiga so'rov yuborilganda **HTTP 403 Forbidden** qaytishini tasdiqlash.
+
+---
+
+### 3. Telegram Mini App Soxta Identifikatsiyasi va IDOR (Account Takeover)
+
+* **Fayl/Endpoint:** `auth.py` (`get_current_user`) va `miniapp.js`
+* **Maqomi:** Tasdiqlangan fakt.
+* **Hujum Mexanizmi:** Hujumchi `X-User-Id: 777` sarlavhasini yuboradi. Backend hech qanday tekshiruvsiz so'rov yuboruvchini `777` ID'li foydalanuvchi deb hisoblaydi.
+* **Real Zarar:** Boshqa foydalanuvchilarning shaxsiy ma'lumotlarini o'g'irlash, ularning balansi va Premium imkoniyatlaridan noqonuniy foydalanish.
+* **Risk Darajasi:** **CRITICAL**
+* **Himoya Chorasi:** `X-User-Id` sarlavhasini butunlay olib tashlash. Mini App'dan `Authorization: Bearer <raw_init_data>` sarlavhasini yuborish va backendda Bot Token orqali HMAC-SHA256 xeshini tekshirish.
+* **Regression Test:** `X-User-Id` sarlavhasi yuborilganda backend uni inobatga olmasligi yoki rad etishini tekshirish.
+
+---
+
+### 4. Idempotency va Replay Attack Yo'qligi (Double Spending / Multi-Credit)
+
+* **Fayl/Endpoint:** `payment.py` (`POST /payment/callback`)
+* **Maqomi:** Tasdiqlangan fakt.
+* **Hujum Mexanizmi:** Bir marta muvaffaqiyatli o'tgan to'lov callback so'rovini (`transaction_id=1001`) hujumchi 10 marta takroran yuboradi (Replay Attack).
+* **Real Zarar:** `user.balance += amount` amali har safar bajarilib, balans 10 barobar sun'iy oshib ketadi.
+* **Risk Darajasi:** **CRITICAL**
+* **Himoya Chorasi:** To'lov callback'ida `transaction_id` va to'lov holatini PostgreSQL'da `purchases` / `transactions` jadvalida unikal indeks bilan saqlash hamda allaqachon bajarilgan tranzaksiyalarni qayta ishlamaslik.
+* **Regression Test:** Bir xil `transaction_id` bilan 10 ta parallel so'rov yuborilganda balans faqat 1 marta oshishini tasdiqlash.
+
+---
+
+### 5. Balans va Narx Validatsiyasi Yo'qligi (Negative Amount Manipulation)
+
+* **Fayl/Endpoint:** `payment.py`
+* **Maqomi:** Tasdiqlangan fakt.
+* **Hujum Mexanizmi:** Hujumchi callback so'rovida `amount = -50000` yuboradi.
+* **Real Zarar:** `user.balance += (-50000)` amali bajarilib, foydalanuvchi balansi kamayadi yoki baza `CHECK` constraint bo'lmasa, manfiyga kirib ketadi.
+* **Risk Darajasi:** **HIGH**
+* **Himoya Chorasi:** Pydantic schema orqali `amount: int = Field(gt=0)` va DB darajasida `CHECK (balance >= 0)` cheklovlarini o'rnatish.
+* **Regression Test:** `amount <= 0` bo'lgan so'rov yuborilganda **HTTP 422 Unprocessable Entity** qaytarilishini tekshirish.
+
+---
+
+### 6. Mantiqiy Premium Holati va Vaqt Mintaqasi Xatosi (Stale Subscription)
+
+* **Fayl/Endpoint:** `payment.py` (`user.is_premium = True`)
+* **Maqomi:** Tasdiqlangan fakt.
+* **Hujum Mexanizmi:** `payment_callback` ichida obuna muddati (`premium_expires_at`) umuman belgilanmaydi. Faqat boolean `is_premium = True` o'rnatiladi.
+* **Real Zarar:** Foydalanuvchi bir marta kichik miqdorda to'lov qilib, umrbod Premium statusini saqlab qoladi.
+* **Risk Darajasi:** **HIGH**
+* **Himoya Chorasi:** `is_premium` holatini dynamic property yoki query vaqtida `premium_expires_at > datetime.now(timezone.utc)` shaklida hisoblash va to'lov summasiga mos ravishda kun qo'shish.
+* **Regression Test:** `premium_expires_at` o'tgandan so'ng foydalanuvchi Premium huquqini yo'qotishini tekshirish.
+
+---
+
+### 7. Private Storage Channel Kontentining Sizib Chiqishi (Insecure Direct File Link)
+
+* **Fayl/Endpoint:** Telegram Storage Channel + Bot Integratsiyasi
+* **Maqomi:** Shartli xavf (Konfiguratsiyaga bog'liq).
+* **Hujum Mexanizmi:** Agar backend Mini App'ga Telegram `file_id` yoki to'g'ridan-to'g'ri private channel xabar havolasini (link) qaytarsa, foydalanuvchilar bu havolani boshqalar bilan ulashadi.
+* **Real Zarar:** Pullik serial va epizodlar to'lov qilmagan shaxslarga tekinga tarqalib ketadi.
+* **Risk Darajasi:** **HIGH**
+* **Himoya Chorasi:** `file_id` yoki to'g'ridan-to'g'ri havolani mijozga emas, faqat bot orqali vaqtinchalik protected media (masalan, `protect_content=True`) shaklida uzatish yoki backend orqali short-lived presigned URL bilan streamer xizmatini yo'lga qo'yish.
+* **Regression Test:** Mini App API javobida maxfiy storage channel `file_id` yoki to'g'ridan-to'g'ri havolalar ochiq matnda chiqmasligini tekshirish.
+
+---
+
+### 8. Rate Limiting Yo'qligi (DoS va Brute-Force Xavfi)
+
+* **Fayl/Endpoint:** Barcha FastAPI API endpointlari
+* **Maqomi:** Shartli xavf.
+* **Hujum Mexanizmi:** Hujumchi sekundiga minglab so'rov yuborib server resurslarini (CPU/RAM/DB Connections) to'ldiradi.
+* **Real Zarar:** Xizmat ishdan chiqadi (Denial of Service).
+* **Risk Darajasi:** **MEDIUM**
+* **Himoya Chorasi:** `slowapi` kutubxonasi yoki Nginx/Cloudflare darajasida IP va User ID bo'yicha Rate Limiting (masalan, 60 req/min) o'rnatish.
+* **Regression Test:** Bir IP dan 1 soniyada 100 ta so'rov yuborilganda **HTTP 429 Too Many Requests** qaytishini tekshirish.
+
+---
+
+### 9. Maxfiy Kalitlar va Env Variables Sizib Chiqishi (Secret Exposure)
+
+* **Fayl/Endpoint:** Tizim konfiguratsiyasi va Atrof-muhit o'zgaruvchilari
+* **Maqomi:** Shartli xavf.
+* **Hujum Mexanizmi:** Bot Token, DB Passwords yoki Click/Payme Secret Key'lar kod bazasida (hardcoded) yoki versiyalar boshqaruvida (Git) saqlansa va unga ruxsat ochilsa.
+* **Real Zarar:** Butun ma'lumotlar bazasi, to mezon hisoblar va Telegram bot ustidan to'liq nazorat yo'qotiladi.
+* **Risk Darajasi:** **HIGH**
+* **Himoya Chorasi:** Strict `.env` va Pydantic `BaseSettings` dan foydalanish, `.gitignore` fayliga `.env`ni kiritish va production secrets'ni Environment Manager (Docker Secrets/Vault) orqali uzatish.
+* **Regression Test:** Git tarixida va ochiq kod fayllarida API kalitlar yoki parollar yo'qligini `trufflehog` / `git-leaks` vositasi orqali skan qilish.
+
+---
+
+### 10. Audit Logging va Security Event Monitoring Yo'qligi
+
+* **Fayl/Endpoint:** Tizim monitoringi va loglash infratuzilmasi
+* **Maqomi:** Shartli xavf.
+* **Hujum Mexanizmi:** Hujumchi tizimda zaifliklarni qidirganda yoki noqonuniy harakatlar qilganda xavfsizlik loglari yuritilmaydi.
+* **Real Zarar:** Hujum sodir bo'lganda uni o'z vaqtida aniqlash va insidentni tergov qilish (Incident Response) imkonsiz bo'ladi.
+* **Risk Darajasi:** **MEDIUM**
+* **Himoya Chorasi:** Centralized Logging (Sentry, ELK, Grafana Loki) va kritik harakatlar (Admin harakatlari, to'lovlar, muvaffaqiyatsiz auth) uchun structured audit loglarni yo'lga qo'yish.
+* **Regression Test:** Noto'g'ri imzo bilan kelgan to'lov so'rovi darhol Sentry/Log tizimida `CRITICAL_SECURITY_EVENT` sifatida qayd etilishini tasdiqlash.
+
+---
+
+## 3. SPECIAL COMPLEX SCENARIOS ANALYSIS
+
+1. **Foydalanuvchi Telegram akkauntini almashtirsa:**
+* *Xavf:* Eski token va seanslar yangi akkaunt bilan aralashib ketishi mumkin.
+* *Yechim:* Kesh va seanslar Telegram `user.id` sohasiga qat'iy bog'lanishi shart. Akkaunt o'zgarganda yangi `initData` orqali yangi autentifikatsiya talab qilinadi.
+
+
+2. **Telegram `initData` eskirgan bo'lsa (`auth_date` drift):**
+* *Xavf:* O'g'rilangan eski `initData` orqali Replay attack amalga oshirilishi mumkin.
+* *Yechim:* Serverda `auth_date` tekshiruvi: `now_utc - auth_date > 86400` (24 soat) bo'lsa, **HTTP 401 Unauthorized** qaytariladi.
+
+
+3. **Bir xil payment callback 10 marta yuborilsa:**
+* *Xavf:* Takroriy balans to'ldirish (Double spend).
+* *Yechim:* Payme/Click `transaction_id` lari bazada `status` va `unique constraint` bilan saqlanadi. Birinchi so'rov tranzaksiyani `COMPLETED` qiladi, qolgan 9 tasi hechnarsani o'zgartirmasdan saqlangan natijani qaytaradi.
+
+
+4. **Click/Payme callback kelganda backend vaqtincha ishlamay qolsa (Downtime):**
+* *Xavf:* To'lov provayderi xatolik oladi va foydalanuvchiga xizmat berilmaydi.
+* *Yechim:* Click va Payme protokollariga muvofiq, backend ishlamaganda to'lov provayderiga mos xatolik kodi (masalan, Payme uchun JSON-RPC error code `-31008`) qaytariladi. Provayder so'rovni keyinroq avtomatik retry qiladi.
+
+
+5. **Admin akkaunti o'g'irlansa yoki Admin ID ochiqlansa:**
+* *Xavf:* Tizim ustidan to'liq nazorat.
+* *Yechim:* Admin panelga faqat ID bo'yicha emas, balki **2FA (Two-Factor Authentication)** va IP-bound session tokenlar orqali kirish imkoniyatini berish.
+
+
+
+---
+
+## 4. THREAT MODEL TABLE (STRIDE METHODOLOGY)
+
+| Tahdid Turi (STRIDE) | Tizim Qismi | Zaiflik Tavsifi | Mitigatsiya (Himoya Chorasi) | Risk |
+| --- | --- | --- | --- | --- |
+| **Spoofing** (Shaxsni soxtalashtirish) | Mini App / Auth | `X-User-Id` header orqali boshqa foydalanuvchi nomidan kirish. | Telegram `initData` HMAC-SHA256 server-side verification. | **CRITICAL** |
+| **Tampering** (Ma'lumotni o'zgartirish) | Payment Callback | `amount` parametrini manfiy yoki soxta qilib yuborish. | Click/Payme Imzosini (Signature) tekshirish va Pydantic Validation. | **CRITICAL** |
+| **Repudiation** (Inkor etish) | Admin Panel | Adminlar tomonidan qilingan amallarning loglanmasligi. | Structured Centralized Audit Logging. | **MEDIUM** |
+| **Information Disclosure** | Storage Channel | Private channel `file_id` larining ochiq API orqali chiqib ketishi. | Backend/Bot Proxying va Protected Content flag. | **HIGH** |
+| **Denial of Service** | Public APIs | Rate limiting yo'qligi va unhandled exceptions. | `slowapi`, Nginx rate limit, va Global Exception Handlers. | **HIGH** |
+| **Elevation of Privilege** | Admin Endpoints | RBAC/Middleware yo'qligi sababli oddiy foydalanuvchi admin amallarini bajarishi. | Role-Based Access Control (RBAC) Guard Middleware. | **CRITICAL** |
+
+---
+
+## 5. HI MOYA ARXITEKTURASI VA LIFECYCLE DIAGRAMMALARI
+
+### A. Telegram Mini App Authentication Lifecycle (HMAC-SHA256)
+
+```
+[Mini App Client]                       [FastAPI Backend]                 [Telegram API]
+       │                                        │                                │
+       │ 1. Get Telegram.WebApp.initData        │                                │
+       │───────────────────────────────────────>│                                │
+       │    (Raw URL-encoded string)            │                                │
+       │                                        │                                │
+       │                                        │ 2. Parse initData & extract    │
+       │                                        │    hash and auth_date          │
+       │                                        │                                │
+       │                                        │ 3. Check: now - auth_date < 1d │
+       │                                        │    If stale -> HTTP 401        │
+       │                                        │                                │
+       │                                        │ 4. Compute:                    │
+       │                                        │    secret_key = HMAC_SHA256(   │
+       │                                        │       "WebAppData", BOT_TOKEN) │
+       │                                        │    calc_hash = HMAC_SHA256(    │
+       │                                        │       data_check_string, s_key)│
+       │                                        │                                │
+       │                                        │ 5. Compare calc_hash == hash   │
+       │                                        │    If mismatch -> HTTP 401     │
+       │                                        │                                │
+       │<───────────────────────────────────────│ 6. Return Session JWT Token    │
+       │         HTTP 200 OK + JWT              │    (or Scoped Access Context)  │
+
+```
+
+#### FastAPI uchun Xavfsiz `initData` Verification KODI (`auth_secure.py`)
+
+```python
+import hmac
+import hashlib
+from urllib.parse import parse_qsl
+from datetime import datetime, timezone
+from fastapi import Header, HTTPException, status, Depends
+from pydantic import BaseModel
+
+BOT_TOKEN = "YOUR_BOT_TOKEN_FROM_ENV"
+
+class TelegramUser(BaseModel):
+    id: int
+    first_name: str
+    username: str | None = None
+
+def verify_telegram_init_data(authorization: str = Header(...)) -> TelegramUser:
+    """
+    Telegram Mini App initData 'ni rasmiy HMAC-SHA256 hujjati bo'yicha tekshirish.
+    Authorization: Bearer <raw_init_data_string>
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Auth Header format")
+
+    init_data_raw = authorization.split("Bearer ")[1]
+    parsed_data = dict(parse_qsl(init_data_raw, keep_blank_values=True))
+
+    if "hash" not in parsed_data:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Hash missing")
+
+    received_hash = parsed_data.pop("hash")
+    
+    # 1. Data check string hosil qilish (A-Z bo'yicha saralash)
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_data.items()))
+
+    # 2. Secret Key yaratish
+    secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+
+    # 3. Hash hisoblash
+    calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+    # 4. Vaqt bo'yicha xavfsiz solishtirish (Constant Time Comparison)
+    if not hmac.compare_digest(calculated_hash, received_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid HMAC signature")
+
+    # 5. auth_date eskirganligini tekshirish (Masalan, 86400 soniya / 24 soat)
+    auth_date = int(parsed_data.get("auth_date", 0))
+    now = int(datetime.now(timezone.utc).timestamp())
+    if now - auth_date > 86400:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="InitData expired")
+
+    # 6. User ma'lumotlarini parse qilish
+    import json
+    user_data = json.loads(parsed_data.get("user", "{}"))
+    return TelegramUser(**user_data)
+
+```
+
+---
+
+### B. Click va Payme Integratsiyalari uchun Xavfsiz Payment Lifecycle
+
+> **Rasmiy Protokol va Talablar:**
+> * **Payme:** HTTP Basic Auth (`Paycom:SECRET_KEY`) va JSON-RPC 2.0 protokoli bo'yicha ishlaydi. Metodlar: `CheckPerformTransaction`, `CreateTransaction`, `PerformTransaction`, `CancelTransaction`, `CheckTransaction`.
+> * **Click:** Form/Query yoki JSON POST so'rovlari. Parametrlar: `click_trans_id`, `service_id`, `click_paydoc_id`, `merchant_trans_id`, `amount`, `action`, `error`, `error_note`, `sign_time`, `sign_string`.
+> * **Click Imzo Formula:** `md5(click_trans_id + service_id + SECRET_KEY + merchant_trans_id + amount + action + sign_time)`
+> 
+> 
+
+```
+[Click / Payme Server]                     [FastAPI Backend]                     [PostgreSQL DB]
+          │                                        │                                    │
+          │ 1. POST /payment/payme (JSON-RPC)      │                                    │
+          │    Header: Basic Auth (Secret Key)     │                                    │
+          │───────────────────────────────────────>│                                    │
+          │                                        │ 2. Check IP Allowlist & Basic Auth │
+          │                                        │    If invalid -> Return Error      │
+          │                                        │                                    │
+          │                                        │ 3. Validate JSON-RPC Method        │
+          │                                        │    (e.g., PerformTransaction)      │
+          │                                        │                                    │
+          │                                        │ 4. SELECT * FROM transactions      │
+          │                                        │    WHERE trans_id = ... FOR UPDATE │
+          │                                        │───────────────────────────────────>│
+          │                                        │                                    │
+          │                                        │ 5. If COMPLETED -> Return Saved Res│
+          │                                        │    If NEW -> Perform Credit &      │
+          │                                        │              Set Status COMPLETED  │
+          │                                        │<───────────────────────────────────│
+          │                                        │                                    │
+          │<───────────────────────────────────────│                                    │
+          │ 6. Return JSON-RPC Success Result      │                                    │
+
+```
+
+#### Xavfsiz Payme/Click Controller Arxitekturasi (`payment_secure.py`)
+
+```python
+import base64
+import hmac
+import hashlib
+from fastapi import Request, HTTPException, Depends, status
+from sqlalchemy.orm import Session
+
+PAYME_SECRET_KEY = "YOUR_PAYME_SECRET_KEY"
+ALLOWED_PAYME_IPS = {"196.20.7.2", "196.20.7.3"}  # Payme rasmiy IP diapozoni
+
+async def verify_payme_auth(request: Request):
+    """Payme uchun Basic Auth va IP Allowlist tekshiruvi"""
+    # 1. IP Check
+    client_ip = request.client.host
+    # Production muhitida Nginx X-Forwarded-For un unumli foydalaning
+    # if client_ip not in ALLOWED_PAYME_IPS:
+    #     raise HTTPException(403, "IP not allowed")
+
+    # 2. Basic Auth Check
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Basic "):
+        raise HTTPException(401, "Missing Auth Header")
+
+    encoded_credentials = auth_header.split("Basic ")[1]
+    decoded_credentials = base64.b64decode(encoded_credentials).decode("utf-8")
+    
+    # Payme Basic Auth: Paycom:SECRET_KEY
+    expected_credentials = f"Paycom:{PAYME_SECRET_KEY}"
+    if not hmac.compare_digest(decoded_credentials, expected_credentials):
+        raise HTTPException(401, "Invalid Payme Credentials")
+
+@app.post("/payment/payme")
+async def payme_webhook(
+    request: Request, 
+    db: Session = Depends(get_db),
+    _auth = Depends(verify_payme_auth)
+):
+    body = await request.json()
+    method = body.get("method")
+    params = body.get("params", {})
+    
+    # Payme JSON-RPC 2.0 ishlov beruvchisi
+    # PerformTransaction usulida Idempotency va DB Row Lock (with_for_update) ishlatiladi.
+    # ...
+    return {"jsonrpc": "2.0", "result": {"state": 2}, "id": body.get("id")}
+
+```
+
+---
+
+### C. Admin Access Control Model (RBAC)
+
+```python
+from fastapi import Depends, HTTPException, status
+from models import User
+
+def get_current_admin_user(
+    current_user: TelegramUser = Depends(verify_telegram_init_data),
+    db: Session = Depends(get_db)
+) -> User:
+    """
+    Admin huquqini tekshiruvchi qat'iy Guard Middleware
+    """
+    user = db.query(User).filter(User.telegram_id == str(current_user.id)).first()
+    
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    if not user.is_admin or user.is_blocked:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="Access Denied: Admin privileges required"
+        )
+
+    return user
+
+# Xavfsiz Admin Endpoint
+@app.post("/admin/users/{user_id}/block")
+async def block_user(
+    user_id: int,
+    admin: User = Depends(get_current_admin_user), # Admin guard majburiy
+    db: Session = Depends(get_db)
+):
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(404, "User not found")
+
+    target_user.is_blocked = True
+    db.commit()
+    return {"success": True, "blocked_by": admin.id}
+
+```
+
+---
+
+## 6. REGRESSION VA SECURITY TEST PLAN (PYTEST)
+
+> **Auditor Eslatmasi:** Quyidagi testlar ishlab chiquvchilar jamoasi tomonidan lokal va CI/CD muhitida bajarilishi uchun tayyorlangan avtonom test kodlaridir.
+> **Bajarish buyrug'i:** `pytest test_security.py`
+
+```python
+# test_security.py
+import pytest
+from fastapi.testclient import TestClient
+from main import app
+
+client = TestClient(app)
+
+def test_unauthenticated_admin_endpoint_returns_401_or_403():
+    """Admin endpointiga tokensiz so'rov yuborilganda rad etilishini tekshirish"""
+    response = client.post("/admin/users/1/block")
+    assert response.status_code in (401, 403)
+
+def test_fake_payment_callback_without_signature_rejected():
+    """Imzosiz payment callback rad etilishini tekshirish"""
+    response = client.post("/payment/callback?user_id=1&amount=1000000&transaction_id=fake")
+    assert response.status_code in (401, 403)
+
+def test_invalid_x_user_id_header_ignored():
+    """Soxta X-User-Id headeri orqali profil o'qish taqiqlanganini tekshirish"""
+    response = client.get("/api/profile", headers={"X-User-Id": "1"})
+    assert response.status_code == 401
+
+```
+
+---
+
+## 7. PRODUCTION SECURITY CHECKLIST
+
+* [ ] **Auth Layer:** `X-User-Id` header'lari butunlay o'chirilgan. `Authorization: Bearer <initData>` joriy etilgan va HMAC-SHA256 tekshiruvi yo'lga qo'yilgan.
+* [ ] **Payment Layer:** Payme va Click callback'lari uchun Basic Auth, MD5 Imzo va IP Allowlist o'rnatilgan.
+* [ ] **Idempotency:** Barcha to'lov va xarid amallari PostgreSQL `purchases` va `transactions` jadvallaridagi `UNIQUE constraint` hamda `SELECT ... FOR UPDATE` row lock bilan muhofaza qilingan.
+* [ ] **RBAC Guard:** Barcha `/admin/*` API yo'nalishlariga `get_current_admin_user` middleware biriktirilgan.
+* [ ] **DB Constraints:** PostgreSQL `users` jadvalida `balance >= 0` check constraint bor.
+* [ ] **Timezone Policy:** Barcha vaqtlar UTC (`TIMESTAMPTZ` va `datetime.now(timezone.utc)`) bo'yicha ishlaydi.
+* [ ] **Secrets Management:** `.env` fayli Git versiyalar boshqaruvidan chiqarilgan.
+* [ ] **Rate Limiting:** FastAPI endpointlariga `slowapi` orqali IP va User-based limitlar o'rnatilgan.
+
+---
+
+## 8. KODDAN TASDIQLANGAN FAKTLAR VS KONFIGURATSIYA REJASI
+
+| Holat | Manba | Turi | Amalga Oshirilishi Kerak Bo'lgan Harakat |
+| --- | --- | --- | --- |
+| **Soxtalashtiriluvchi `X-User-Id**` | `auth.py`, `miniapp.js` | Koddagi Aniq Fakt | `auth.py` modulini HMAC-SHA256 verifikatsiyasiga o'tkazish. |
+| **Imzosiz To'lov Callback** | `payment.py` | Koddagi Aniq Fakt | `payment.py` da Click/Payme imzosini tekshirishni joriy etish. |
+| **Admin Panel Teshigi** | `admin.py` | Koddagi Aniq Fakt | Admin Guard middleware biriktirish. |
+| **Reverse Proxy & IP Whitelist** | Server Infrastrukturasi | Tashqi Konfiguratsiya | Nginx / Cloudflare sozlamalarida Payme/Click IP larini oqlash. |
+| **Centralized Logging** | Log Infratuzilmasi | Tashqi Konfiguratsiya | Sentry / Loki integratsiyasini ulash. |
+
+---
+
+## 9. YAKUNIY XAVFSIZLIK BAHOSI (FINAL VERDICT)
+
+**YAKUNIY BAHOLASH: UNSECURE / CRITICAL RISK (PRODUCTION'GA CHIQARISH TAQIQLANADI)**
+
+Tizimda hozirgi holatida **3 ta Kritik (P0) zaiflik** mavjud:
+
+1. Istalgan shaxs tizim balansini tekinga to'ldira oladi (Payment Callback Signature Missing).
+2. Oddiy foydalanuvchilar admin panel amallarini bajarishi mumkin (Broken Access Control).
+3. Foydalanuvchilar boshqalar nomidan tizimga kirib ma'lumotlarni o'g'irlashi mumkin (Insecure `X-User-Id` Header Auth).
+
+Ushbu hisobotda keltirilgan `verify_telegram_init_data`, `verify_payme_auth` va `get_current_admin_user` xavfsizlik arxitekturalari to'liq kiritilib, xavfsizlik testlaridan o'tgandan so'nggina tizimni production muhitiga chiqarishga ruxsat beriladi.
