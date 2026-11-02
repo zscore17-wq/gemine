@@ -1,0 +1,216 @@
+# MULTI-FILE PROJECT AUDIT HISOBOTI
+
+**Tizim:** FastAPI Backend, SQLAlchemy ORM (SQLite), Telegram Bot va Telegram Mini App
+
+**Auditor:** Senior Software Engineer, Backend Architect & Application Security Engineer
+
+**Hujjat xarakteri:** Production-Ready tayyorgarlik auditi va xavfsizlik tahlili
+
+---
+
+## 1. MAVJUD MANBALAR VA MA'LUMOTLAR KLASSIFIKATSIYASI
+
+* **Tasdiqlangan faktlar (Koddagi aniq ko'ringan holatlar):**
+* `auth.py` faylidagi `get_current_user` autentifikatsiya funksiyasi faqatgina mijoz yuborgan `X-User-Id` HTTP sarlavhasiga (header) tayanadi; hesh yoki token tekshiruvi yo'q.
+* `main.py` faylidagi `/profile` endpointi foydalanuvchining Premium holatini aniqlashda faqat `user.is_premium` ustunini tekshiradi, `premium_expires_at` vaqtini hisobga olmaydi.
+* `bot.py` faylidagi `is_premium_active` funksiyasi `user.is_premium` bilan birga `premium_expires_at > datetime.now()` shartini ham tekshiradi.
+* `miniapp/app.js` kodi Telegram `initDataUnsafe` ma'lumotlaridan foydalanadi va `/profile?user_id=${userId}` so'rovini yuboradi.
+* `database.py` SQLite faylli bazasidan (`sqlite:///./app.db`) standart parametrlarsiz foydalanadi.
+
+
+* **Noma'lumlar (Qo'shimcha ma'lumot talab qiladigan holatlar):**
+* Production muhitida reverse proxy (Nginx, Traefik va h.k.) mavjudligi va u sarlavhalarni tozalash-tozalamasligi.
+* Bot va FastAPI serverining bir xil vaqt mintaqasida (timezone) va bitta serverda joylashgani.
+* Baza fayliga bo'lgan operatsion tizim darajasidagi ruxsatlar (file permissions).
+
+
+
+---
+
+## 2. AUDIT SAVOLLARIGA CHUQUR TEXNIK JAVOBLAR
+
+### 1. Ilova ishga tushishiga to‘sqinlik qiluvchi xatolar (Startup Phase)
+
+* **Tahlil:** Modullarni import qilish va FastAPI ilovasini ishga tushirish bosqichida sintaktik yoki import xatolari yo'q (`Base.metadata.create_all(bind=engine)` ishlaydi).
+* **Fakt:** Ilova sintaktik jihatdan ishga tushadi, lekin runtime (ishlash) davomida birinchi so'rovoq SQLite ko'p oqimli (multithreaded) cheklovlari va `X-User-Id` ma'lumot turi xatolari sababli izdan chiqadi.
+
+### 2. Autentifikatsiya va Avtorizatsiya xavfsizligi
+
+* **Tahlil:** Autentifikatsiya **umuman xavfsiz emas**. `auth.py` fayli mijoz tomonidan yuborilgan `X-User-Id` matnini to'g'ridan-to mezon `int()` ga o'girib, foydalanuvchi ID'si sifatida qabul qiladi.
+* **Mini App va `initDataUnsafe` tahlili:** `miniapp/app.js` ichida `telegram.initDataUnsafe?.user?.id` ishlatilgan. `initDataUnsafe` bu mijoz (browser) xotirasidagi ochiq ob'ekt bo'lib, xaker DevTools orqali uni va `X-User-Id` sarlavhasini ixtiyoriy foydalanuvchi ID'siga o'zgartira oladi. Serverda HMAC-SHA256 xeshi (`initData`) bot tokeni orqali tekshirilmagani sababli autentifikatsiya to'liq soxtalashtiriladi.
+
+### 3. Oddiy foydalanuvchi boshqa foydalanuvchining profilini ko‘ra oladimi?
+
+* **Tahlil:** Ha, ko'ra oladi.
+* **Sababi:** Oddiy foydalanuvchi so'rov sarlavhasida `X-User-Id: <boshqa_user_id>` yuborishi kifoya. `/profile` endpointi `get_current_user` qaytargan ID bo'yicha bazani qidiradi va o'sha foydalanuvchining balansi hamda premium statusini qaytaradi (IDOR zaifligi).
+
+### 4. Admin huquqini soxtalashtirish yoki aylanib o‘tish mumkinmi?
+
+* **Tahlil:** Ha, to'liq imkoniyat bor (Privilege Escalation).
+* **Sababi:** `/admin/grant-premium/{target_id}` endpointi so'rov yuboruvchining `is_admin` ekanligini bazadan tekshiradi, lekin foydalanuvchi kimligini `get_current_user` (`X-User-Id` header) orqali aniqlaydi. Hujumchi haqiqiy adminning Telegram ID'sini `X-User-Id` sarlavhasida yuborsa, backend uni admin deb hisoblaydi va so'rovni bajaradi.
+
+### 5. Premium muddati, vaqt zonasi va `is_premium` muammolari
+
+* **Tahlil:**
+1. `grant_premium` funksiyasida `days` parametri uchun chegara tekshiruvi yo'q. `days = -10` yuborilsa, `premium_expires_at` o'tmishdagi vaqtga o'rnatiladi.
+2. `datetime.now()` vaqt mintaqasisiz (naive datetime) ishlaydi. Server va baza turli vaqt zonalarida bo'lsa, muddat bir necha soatga noto'g'ri hisoblanadi.
+3. Bazadagi `is_premium` ustuni static boolean bo'lib, muddat o'tgach avtomatik `False` ga o'zgarmaydi (avto-invalidation yo'q).
+
+
+
+### 6. Bot va Mini App bir xil Premium natijasini ko‘rsatadimi?
+
+* **Tahlil:** Yo'q, ma'lumotlarda qarama-qarshilik (data inconsistency) bor.
+* **Sababi:**
+* `bot.py` faylidagi `is_premium_active()` funksiyasi ham `is_premium`, ham `premium_expires_at > datetime.now()` shartini tekshiradi (Vaqt o'tgan bo'lsa `False` qaytaradi).
+* `main.py` dagi `/profile` endpointi esa faqat bazadagi static `user.is_premium` ustunini qaytaradi.
+* **Oqibat:** Premium muddati tugagan foydalanuvchiga Bot "Obuna nofaol" desa, Mini App "Obuna faol" deb ko'rsatadi.
+
+
+
+### 7. Mini App API bilan ishlashidagi xatolar
+
+* **Tahlil:**
+1. `fetch('/profile?user_id=${userId}', ...)` so'rovi URL'da `user_id` query parametrini yuboradi, lekin backend `/profile` endpointi bu query parametrni qabul qilmaydi (faqat `X-User-Id` header'ni o'qiydi).
+2. Telegram WebApp kontekstidan tashqarida ochilganda `userId` qiymati `undefined` bo'ladi. JS uni `String("undefined")` qilib yuboradi. Backend `int("undefined")` bajarib, **HTTP 500 (ValueError)** otadi.
+3. JS kodida `if (!response.ok)` tekshiruvi yo'q. Backend HTTP 401, 404 yoki 500 qaytarganda JS interfeysga `"undefined"` matnini chiqaradi.
+
+
+
+### 8. SQLite, SQLAlchemy Session va parallel so‘rovlar xavfi
+
+* **Tahlil:**
+1. FastAPI `def profile(...)` kabi sinxron funksiyalarni alohida threadpool oqimlarida ishga tushiradi. `database.py` faylida SQLite uchun `check_same_thread=False` parametri berilmagan. Parallel so'rovlar kelganda SQLite `ProgrammingError` otadi.
+2. Parallel yozish amallarida (masalan, bir vaqtda `grant_premium` bajarilganda) SQLite bazasi bloklanadi (`OperationalError: database is locked`).
+
+
+
+### 9. Ma'lumotlar bazasi migratsiyasi va `create_all()` muammolari
+
+* **Tahlil:**
+1. `Base.metadata.create_all(bind=engine)` faqat mavjud bo'lmagan jadvallarni yaratadi. Ishlab turgan jadval ustunlarini o'zgartira olmaydi yoki qo'sha olmaydi.
+2. `main.py` import qilingan zahoti global miqyosda `create_all()` chaqirilgan. Bu avtomatlashtirilgan testlarni va izolyatsiyalangan muhitlarni sozlashni qiyinlashtiradi. Production uchun Alembic migratsiya vositasi yo'q.
+
+
+
+### 10. Muammolarni prioritetsiyalash (P0 - P3)
+
+* **P0 (Kritik / Blocker):** Sarlavha orqali Auth soxtalashtirish (IDOR va Admin Privilege Escalation), `int(x_user_id)` sababli HTTP 500 crash.
+* **P1 (Yuqori):** Bot va Mini App o'rtasidagi Premium holati nomutanosibligi, `grant_premium` ichida `days` parametrining validatsiyasizligi.
+* **P2 (O'rta):** SQLite ko'p oqimli blokirovkalari, Naive `datetime.now()` vaqt mintaqasi xatosi, Mini App JS da javob statusi tekshirilmasligi.
+* **P3 (Quyi):** Mini App JS da keraksiz URL query parametri, `create_all()` modul darajasida chaqirilishi.
+
+---
+
+## 3. MUAMMOLARNING ATOMAR DETALLASHTIRILGAN RO'YXATI
+
+#### Muammo 1: Soxtalashtiriluvchi Autentifikatsiya va IDOR/Admin Escalation
+
+* **Fayl va qator:** `auth.py` (5-10-qatorlar) va `main.py` (22, 38-qatorlar)
+* **Maqomi:** Tasdiqlangan fakt
+* **Texnik sabab:** `get_current_user` funksiyasi shaxsni tasdiqlovchi kriptografik belgi (kvitansiya, token, initData hash) o'rniga ochiq `X-User-Id` sarlavhasiga tayanadi.
+* **Real oqibat:** Hujumchi ixtiyoriy foydalanuvchi yoki admin ID'sini sarlavhada yuborib, boshqaning profilini ko'radi va admin huquqini qo'lga kiritadi.
+* **Xavf darajasi:** **P0 (Kritik)**
+* **Tavsiya:** Mini App so'rovlarida Telegram `initData` matnini uzatish va backendda Bot Token yordamida HMAC-SHA256 xeshini tekshiruvchi auth middleware yaratish.
+* **Test:** Test so'rovi sarlavhasida soxta `X-User-Id` yuborilganda tizim **HTTP 401 Unauthorized** qaytarishini tekshirish.
+
+#### Muammo 2: Noto'g'ri kiritma oqibatida Unhandled Exception (HTTP 500)
+
+* **Fayl va qator:** `auth.py` (10-qator) -> `return int(x_user_id)`
+* **Maqomi:** Tasdiqlangan fakt
+* **Texnik sabab:** `x_user_id` parametri raqam bo'lmagan matn (masalan, `"undefined"` yoki `"abc"`) bo'lganda `ValueError` otiladi va u `try-except` bilan ushlanmagan.
+* **Real oqibat:** Mini App yuklanmay qolganda yoki buzg'unchi matn yuborganda server HTTP 500 qaytaradi.
+* **Xavf darajasi:** **P0 (Kritik)**
+* **Tavsiya:** `x_user_id.isdigit()` tekshiruvini qo'shish yoki `try-except ValueError` orqali **HTTP 400/401** otish.
+* **Test:** `X-User-Id: invalid_id` sarlavhasi bilan so'rov yuborilganda server HTTP 400/401 qaytarishini tasdiqlash.
+
+#### Muammo 3: Bot va Mini App o'rtasidagi biznes-mantiq va ma'lumotlar tafovuti
+
+* **Fayl va qator:** `main.py` (33-qator) va `bot.py` (13-18-qatorlar)
+* **Maqomi:** Tasdiqlangan fakt
+* **Texnik sabab:** `/profile` faqat `user.is_premium` ustunini uzatadi; `bot.py` esa `is_premium_active()` funksiyasi orqali vaqtni ham tekshiradi.
+* **Real oqibat:** Obuna muddati tugagan foydalanuvchi Botda "Nofaol", Mini App'da esa "Faol" statusini ko'radi.
+* **Xavf darajasi:** **P1 (Yuqori)**
+* **Tavsiya:** `/profile` endpointida vaqtni dinamik solishtiruvchi mantiqni joriy etish yoki ORM modelida `@hybrid_property` orqali statusni hisoblash.
+* **Test:** Obuna muddati o'tgan `User` ob'ekti uchun `/profile` so'rovi va `is_premium_active()` bir xil `False` qaytarishini tekshirish.
+
+#### Muammo 4: Manfiy vaqt va cheklovlar yo'qligi (`grant_premium`)
+
+* **Fayl va qator:** `main.py` (37, 56-qatorlar)
+* **Maqomi:** Tasdiqlangan fakt
+* **Texnik sabab:** `days: int` parametri uchun Pydantic `Field(gt=0)` yoki mantiqiy tekshiruv yo'q.
+* **Real oqibat:** Admin bilmasdan yoki hujumchi `days = -100` yuborib, foydalanuvchining obuna vaqtini buzishi mumkin.
+* **Xavf darajasi:** **P1 (Yuqori)**
+* **Tavsiya:** `days` parametri `days > 0` bo'lishini tekshirish.
+* **Test:** `days = -5` parametri bilan `/admin/grant-premium/1` endpointiga so'rov yuborilganda **HTTP 422 / 400** qaytishini tekshirish.
+
+#### Muammo 5: SQLite Multithreading va Concurrency Locking
+
+* **Fayl va qator:** `database.py` (4, 6-qatorlar)
+* **Maqomi:** Tasdiqlangan fakt
+* **Texnik sabab:** FastAPI sinxron endpointlarni ko'p oqimli threadpool'da ishlatadi. SQLite faylli drayveri `check_same_thread=False` va taym-aut sozlamalarisiz parallel so'rovlarda ziddiyatga uchraydi.
+* **Real oqibat:** Bir vaqtning o'zida bir nechta so'rov kelganda bazada `OperationalError: database is locked` yuzaga keladi.
+* **Xavf darajasi:** **P2 (O'rta)**
+* **Tavsiya:** Production uchun PostgreSQL bazasiga o'tish yoki SQLite ulagichiga `connect_args={"check_same_thread": False}` va `timeout` berish.
+* **Test:** Parallel 20 ta yozish so'rovini yuborib, baza bloklanishini tekshirish.
+
+#### Muammo 6: Naive Datetime (Vaqt mintaqasi yo'qligi)
+
+* **Fayl va qator:** `main.py` (56-qator), `bot.py` (18-qator)
+* **Maqomi:** Tasdiqlangan fakt
+* **Texnik sabab:** `datetime.now()` ishlatilmoqda. U UTC vaqtini emas, serverning mahalliy vaqtini oladi.
+* **Real oqibat:** Server va baza vaqt zonalari har xil bo'lsa, obuna muddati ertaroq yoki kechiroq tugaydi.
+* **Xavf darajasi:** **P2 (O'rta)**
+* **Tavsiya:** Barcha joyda `datetime.now(timezone.utc)` (UTC) standartidan foydalanish.
+* **Test:** Turli vaqt mintaqasi sozlamalarida vaqt solishtiruvi to'g'ri ishlashini unit-test qilish.
+
+#### Muammo 7: Mini App Front-End Javoblarini va Xatoliklarni Noto'g'ri Boshqarish
+
+* **Fayl va qator:** `miniapp/app.js` (4, 15-qatorlar)
+* **Maqomi:** Tasdiqlangan fakt
+* **Texnik sabab:** `fetch` javobining `response.ok` xossasi tekshirilmaydi; `initDataUnsafe` bo'sh bo'lishi inobatga olinmagan.
+* **Real oqibat:** Server xatosi yuz berganda foydalanuvchi ekranida `"undefined"` matnlari chiqib qoladi.
+* **Xavf darajasi:** **P2 (O'rta)**
+* **Tavsiya:** JS kodida HTTP statusni tekshirish (`if (!response.ok) throw ...`) va xatolik interfeysini ko'rsatish.
+* **Test:** Backend HTTP 500 yoki 401 qaytarganda interfeys qashshoq holatga tushmasligini tekshirish.
+
+---
+
+## 4. XULOSA VA REKLAMA/TAYYORGARLIK PLANLARI
+
+### 1. Eng xavfli 5 ta muammo
+
+1. **Soxta HTTP Header orqali Autentifikatsiyani aylanib o'tish (Admin & IDOR Takeover).**
+2. **`initData` xeshi serverda tekshirilmasligi sababli Mini App ma'lumotlarining buzilishi.**
+3. **`int(x_user_id)` sababli yuzaga keladigan server crash (HTTP 500 DoS).**
+4. **Bot va Mini App o'rtasidagi Premium holatining nomutanosibligi.**
+5. **SQLite bazasining parallel so'rovlarda bloklanib qolishi (`database is locked`).**
+
+### 2. Muammolarni tuzatishning to'g'ri ketma-ketligi
+
+```
+[1. Auth & Crypto Fix] ──> [2. Validation & Invalidation Logic] ──> [3. DB Architecture (PostgreSQL)] ──> [4. Frontend Handling]
+
+```
+
+1. **Auth:** `auth.py` modulini qayta ko'rib chiqish, Telegram `initData` xeshini HMAC-SHA256 orqali tekshirishni yo'lga qo'yish.
+2. **Logic & Validation:** Pydantic sxemalarini qo'shish, `days > 0` va `x_user_id` tiplarini tekshirish; `/profile` endpointida vaqt bo'yicha dinamik status qaytarish.
+3. **Database:** SQLite'dan PostgreSQL'ga o'tish, Alembic migratsiyalarini sozlash.
+4. **Frontend:** `app.js` da javob xatoliklarini ushlash hamda `initData` ni sarlavhada to'g'ri uzatish.
+
+### 3. Regression Test Rejasi
+
+* **Auth Unit Tests:** Yaroqsiz xesh yoki begona `user_id` bilan yuborilgan har qanday so'rov **HTTP 401** berishini avtomatlashtirilgan test bilan tekshirish.
+* **Business Logic Integration Tests:** Obuna muddati `datetime.now(timezone.utc)` dan o'tganda Bot ham, Mini App API ham bir xil `is_premium: False` qaytarishini tasdiqlash.
+* **Load / Concurrency Stress Test:** Locust yoki `k6` yordamida 50 ta parallel so'rov yuborib, bazada blokirovkalar va HTTP 500 xatolar yo'qligiga ishonch hosil qilish.
+
+### 4. Production Muhitiga Chiqarishga Tayyormi?
+
+**QAT'IY VERDIKT: TAYYOR EMAS (NOT PRODUCTION-READY).**
+
+Loyiha jiddiy xavfsizlik teshiklariga ega. Autentifikatsiya mexanizmi mavjud emas deb hisoblash mumkin (chunki header osongina soxtalashtiriladi). Tizim ishlab chiqarish muhitiga chiqarilsa, foydalanuvchilar ma'lumotlari sizib chiqadi va admin panel boshqaruvi yo'qotiladi.
+
+### 5. Qo'shimcha ma'lumot kerak bo'lgan xulosalar
+
+1. **Server Muhiti:** Production serverda PostgreSQL ishlatiladimi yoki SQLite qoladimi? (Agar PostgreSQL bo'lsa, multithreading xavfi kamayadi).
+2. **Reverse Proxy:** Backend oldida Nginx/Cloudflare bormi va u tashqaridan keladigan `X-User-Id` sarlavhalarini kesib tashlaydimi?
