@@ -1,0 +1,466 @@
+## 1. Proposed Architecture
+
+`Telegram OS` employs a Modular Monolith architecture bound to a single authoritative PostgreSQL database and a shared Redis caching/event bus layer. This design eliminates split-brain data state across the Telegram Bot, Telegram Mini App (TMA), and Web Admin Dashboard while remaining straightforward to deploy and maintain.
+
+```
+                  +-------------------------------------------------------+
+                  |                     CLIENT LAYER                      |
+                  +-------------------+-------------------+---------------+
+                                      |                   |
+               Telegram App           |     Web App       |  Telegram App
+             +---------------+        |  +-------------+  | +-----------+
+             | Telegram Bot  |        |  | Admin Panel |  | | Mini App  |
+             | (Bot API 7+)  |        |  | (React SPA) |  | | (TMA SDK) |
+             +-------+-------+        |  +------+------+  | +-----+-----+
+                     |                |         |         |       |
+                     | Webhook        | HTTPS   | REST    | HTTPS | REST / initData
+                     v                v         v         v       v
++-----------------------------------------------------------------------------------+
+|                                  EDGE & GATEWAY                                   |
+|  Nginx Reverse Proxy: SSL Termination, WAF, Rate Limiting (Token Bucket)         |
++-----------------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+|                              UNIFIED BACKEND ENGINE                               |
+|                                                                                   |
+|  +------------------+  +------------------+  +------------------+                 |
+|  |   Auth Module    |  |   User Module    |  | Subscription Mod |                 |
+|  | (HMAC validation)|  |  (RBAC/Profile)  |  |  (State Engine)  |                 |
+|  +------------------+  +------------------+  +------------------+                 |
+|  +------------------+  +------------------+  +------------------+                 |
+|  | Payment Gateway  |  | Content Service  |  | Notification Engine|               |
+|  | (Idempotency)    |  |  (Access Matrix) |  |  (Async Worker)  |                 |
+|  +------------------+  +------------------+  +------------------+                 |
++-----------------------------------------------------------------------------------+
+                               |                  |
+           SQLAlchemy 2.0      |                  | Async Redis Client
+           Async Engine        v                  v
++--------------------------------------+  +-----------------------------------------+
+|        PRIMARY DATABASE              |  |         CACHE & BROKER                  |
+|  PostgreSQL 16 Engine                |  |  Redis 7 Cluster                        |
+|  - Relational Schema & Foreign Keys  |  |  - Session Store                        |
+|  - Transactional Isolation (Read Comm)| |  - Task Queue (ARQ / SAQ)              |
+|  - Indexing & Check Constraints      |  |  - Distributed Locks & Rate Limits    |
++--------------------------------------+  +-----------------------------------------+
+
+```
+
+### Core Architecture Flow
+
+1. **Single Source of Truth:** All user actions—whether initiated via inline bot commands, TMA interfaces, or Admin Panel configurations—transit through a unified FastAPI application domain service layer.
+2. **Synchronous REST & Async Workflows:** Real-time state queries (e.g., balance check, user verification) run synchronously. Long-running tasks (e.g., broadcast notifications, payment reconciliation) are pushed to the Redis task queue for async processing.
+3. **Stateless Service Execution:** App instances carry no in-memory state, allowing horizontal scaling behind the Nginx load balancer when traffic spikes occur.
+
+---
+
+## 2. Technology Choices & Justification
+
+| Layer | Selected Tech | Alternative Considered | Justification & Trade-offs |
+| --- | --- | --- | --- |
+| **Language & Engine** | Python 3.12 + FastAPI | Node.js (NestJS) | FastAPI offers native `asyncio` execution, high throughput, fast Pydantic v2 data validation, and automated OpenAPI spec generation. Trade-off: Lower raw single-thread concurrency than Node/Go, offset by UVicorn workers. |
+| **Bot Framework** | `aiogram 3.x` | `python-telegram-bot` | `aiogram 3.x` is built ground-up for `asyncio`, supports Telegram Bot API 7.0+, and utilizes clean Router/Middleware patterns for stateful finite state machines (FSM). |
+| **Frontend Stack** | React 18 + Vite + Tailwind | Vue 3 + Vite | React's ecosystem provides robust UI components (e.g., Shadcn UI) suitable for both complex administrative analytics dashboards and lightweight TMA interfaces. |
+| **Database** | PostgreSQL 16 | MongoDB | Financial workflows, subscription engines, and audit logs require strict ACID compliance, relational integrity, foreign keys, and complex transactional locking (`FOR UPDATE`). |
+| **ORM & Migrations** | SQLAlchemy 2.0 + Alembic | Tortoise ORM | SQLAlchemy 2.0 provides explicit async unit-of-work management, type hints, and mature schema migration capabilities via Alembic. |
+| **Cache & Task Queue** | Redis 7 + ARQ | Celery + RabbitMQ | ARQ uses Redis `asyncio` natively, eliminating heavy dependencies like Celery while delivering lower latency for job scheduling and distributed locking. |
+| **Reverse Proxy** | Nginx | Traefik | High-performance SSL termination, direct static file hosting for frontend builds, built-in HTTP rate limiting, and robust IP filtering. |
+
+---
+
+## 3. Module & Directory Architecture
+
+The system utilizes a Modular Monolith layout to ensure separation of concerns while maintaining a clean, single-repository structure.
+
+```
+telegram_os/
+├── app/
+│   ├── api/                    # FastAPI HTTP Routers
+│   │   ├── v1/
+│   │   │   ├── auth.py         # Telegram initData & Admin login
+│   │   │   ├── users.py        # User profile & permissions management
+│   │   │   ├── subscriptions.py# Plan discovery & management
+│   │   │   ├── payments.py     # Payment initiation & Webhook handlers
+│   │   │   ├── content.py      # Dynamic dynamic dynamic asset delivery
+│   │   │   └── admin.py        # System analytics, audit logs, broadcasts
+│   ├── bot/                    # Telegram Bot Engine
+│   │   ├── handlers/           # Commands, callbacks, inline queries
+│   │   ├── middlewares/        # Auth verification, rate limiting, logging
+│   │   ├── keyboards/          # Inline & Reply keyboards
+│   │   └── bot.py              # aiogram Dispatcher initialization
+│   ├── core/                   # Shared Infrastructure
+│   │   ├── config.py           # Pydantic BaseSettings (Environment envs)
+│   │   ├── database.py         # SQLAlchemy async engine & session maker
+│   │   ├── redis.py            # Redis connection pool
+│   │   └── security.py         # HMAC verification & JWT handling
+│   ├── modules/                # Domain Logic Layer (Pure Business Rules)
+│   │   ├── users/              # Service, Repository, Schemas, Models
+│   │   ├── subscriptions/      # Service, Repository, Schemas, Models
+│   │   ├── payments/           # Abstract Payment Provider, Ledger Logic
+│   │   ├── content/            # Access rules, CRUD
+│   │   └── notifications/      # Worker logic, Broadcast Engine
+│   └── workers/                # ARQ Background Task Definitions
+├── migrations/                 # Alembic Database Migration Scripts
+├── tests/                      # Pytest Test Suite (Unit, Integration, API)
+├── docker-compose.yml
+├── Dockerfile
+└── requirements.txt
+
+```
+
+---
+
+## 4. Database Schema Design
+
+The schema enforces strict referential integrity, explicit constraints, UTC timestamps, and indexed lookup fields.
+
+```sql
+-- Enums
+CREATE TYPE user_role AS ENUM ('user', 'manager', 'admin');
+CREATE TYPE subscription_status AS ENUM ('active', 'expired', 'canceled');
+CREATE TYPE payment_provider AS ENUM ('telegram_stars', 'stripe', 'crypto_tether');
+CREATE TYPE payment_status AS ENUM ('pending', 'completed', 'failed', 'refunded');
+
+-- Users Table
+CREATE TABLE users (
+    id BIGSERIAL PRIMARY KEY,
+    telegram_id BIGINT UNIQUE NOT NULL,
+    username VARCHAR(64) NULL,
+    first_name VARCHAR(64) NOT NULL,
+    last_name VARCHAR(64) NULL,
+    role user_role NOT NULL DEFAULT 'user',
+    is_blocked BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_users_telegram_id ON users(telegram_id);
+
+-- Subscription Plans
+CREATE TABLE subscription_plans (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(128) NOT NULL,
+    price_cents INT NOT NULL CHECK (price_cents >= 0),
+    currency VARCHAR(3) NOT NULL DEFAULT 'USD',
+    duration_days INT NOT NULL CHECK (duration_days > 0),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    features JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+-- User Subscriptions
+CREATE TABLE user_subscriptions (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    plan_id INT NOT NULL REFERENCES subscription_plans(id),
+    status subscription_status NOT NULL DEFAULT 'active',
+    starts_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    auto_renew BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_user_subs_user_status ON user_subscriptions(user_id, status);
+
+-- Financial Transactions Ledger
+CREATE TABLE transactions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    idempotency_key VARCHAR(128) UNIQUE NOT NULL,
+    user_id BIGINT NOT NULL REFERENCES users(id),
+    plan_id INT NULL REFERENCES subscription_plans(id),
+    provider payment_provider NOT NULL,
+    external_transaction_id VARCHAR(256) NULL,
+    amount_cents INT NOT NULL CHECK (amount_cents >= 0),
+    currency VARCHAR(3) NOT NULL DEFAULT 'USD',
+    status payment_status NOT NULL DEFAULT 'pending',
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_transactions_idempotency ON transactions(idempotency_key);
+CREATE INDEX idx_transactions_user_id ON transactions(user_id);
+
+-- System Audit Logs
+CREATE TABLE audit_logs (
+    id BIGSERIAL PRIMARY KEY,
+    actor_id BIGINT NULL REFERENCES users(id),
+    action VARCHAR(128) NOT NULL,
+    entity_type VARCHAR(64) NOT NULL,
+    entity_id VARCHAR(64) NOT NULL,
+    changes JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ip_address VARCHAR(45) NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_audit_logs_actor ON audit_logs(actor_id);
+
+```
+
+---
+
+## 5. Main API & Authentication Specification
+
+### Telegram Mini App Authentication Protocol
+
+The Mini App passes the `X-Telegram-Init-Data` header populated with Telegram's raw initial data string.
+
+1. Parse query-string parameter pairs into key-value map.
+2. Extract the `hash` key and remove it from the map.
+3. Sort remaining keys alphabetically and join as `key=value\n`.
+4. Derive signature key: `secret_key = HMAC-SHA256(key="WebAppData", msg=BOT_TOKEN)`.
+5. Calculate hash: `calculated_hash = HMAC-SHA256(key=secret_key, msg=data_check_string)`.
+6. Compare `calculated_hash` to extracted `hash` in constant time (`hmac.compare_digest`).
+7. Validate `auth_date`: Reject request if `abs(current_timestamp - auth_date) > 86400` (Replay protection).
+
+```
+Client (Mini App)                         FastAPI Service                     PostgreSQL / Redis
+       |                                         |                                    |
+       |--- POST /api/v1/auth/telegram --------->|                                    |
+       |    Header: X-Telegram-Init-Data         |                                    |
+       |                                         |--- Validate HMAC SHA-256 ----------|
+       |                                         |--- Check auth_date <= 24 hours ----|
+       |                                         |                                    |
+       |                                         |--- Upsert User Record ------------>|
+       |                                         |<-- User Entity Returned -----------|
+       |                                         |                                    |
+       |                                         |--- Issue Bearer JWT (TTL 1h) ----->|
+       |<-- 200 OK (Access Token + User Data) ---|                                    |
+
+```
+
+### Key API Endpoints
+
+| Method | Endpoint | Access Level | Description |
+| --- | --- | --- | --- |
+| `POST` | `/api/v1/auth/telegram` | Public | Validates `initData`, upserts user, issues JWT. |
+| `GET` | `/api/v1/users/me` | Authenticated | Fetches user profile, active role, and subscription status. |
+| `GET` | `/api/v1/subscriptions/plans` | Authenticated | Lists currently available subscription plans. |
+| `POST` | `/api/v1/payments/checkout` | Authenticated | Creates a transaction with `idempotency_key` and returns payment gateway link/payload. |
+| `POST` | `/api/v1/payments/webhook/{provider}` | Gateway IP / Verification | Webhook handler with explicit duplicate verification. |
+| `GET` | `/api/v1/admin/analytics` | Admin / Manager | Returns system metrics (MRR, active users, retention). |
+| `POST` | `/api/v1/admin/broadcast` | Admin | Enqueues background push notifications to target user segments. |
+
+---
+
+## 6. Security Threat Model (STRIDE Framework)
+
+```
++-------------------+-------------------------------------+-------------------------------------------------------+
+| Threat Category   | Identified Risk                     | Architectural Mitigation                             |
++-------------------+-------------------------------------+-------------------------------------------------------+
+| Spoofing          | Forged initData or impersonated     | Server-side HMAC-SHA256 signature check using Bot     |
+|                   | user requests.                      | Token secret; client-supplied User ID is ignored.     |
++-------------------+-------------------------------------+-------------------------------------------------------+
+| Tampering         | Client alters purchase amount or    | Server maintains authoritative plan pricing. Client    |
+|                   | subscription duration in payload.   | only sends plan_id; backend sets invoice amount.       |
++-------------------+-------------------------------------+-------------------------------------------------------+
+| Repudiation       | Unauthorized admin changes or       | Immutable append-only `audit_logs` table capturing    |
+|                   | manual user unblocking.             | admin ID, entity ID, diff changes, and IP address.    |
++-------------------+-------------------------------------+-------------------------------------------------------+
+| Information       | Sensitive database errors or bot    | Error-handling middleware returns generic JSON response;|
+| Disclosure        | tokens exposed in API errors.       | secrets loaded exclusively via runtime environment.   |
++-------------------+-------------------------------------+-------------------------------------------------------+
+| Denial of Service | API endpoint flooding or notification| Redis-backed Token Bucket rate limiting on API routers;|
+|                   | queue overload.                     | async background workers process tasks off main thread|
++-------------------+-------------------------------------+-------------------------------------------------------+
+| Elevation of      | Non-admin user querying admin APIs  | Role-Based Access Control (RBAC) middleware validating |
+| Privilege         | via direct URL access (IDOR).       | token claims and DB role on every protected request.  |
++-------------------+-------------------------------------+-------------------------------------------------------+
+
+```
+
+---
+
+## 7. Testing Strategy
+
+The test suite enforces structural code validity, strict transaction isolation, and idempotency guarantees.
+
+```
+                              +---------------------------------------+
+                              |         End-to-End Tests (E2E)        |
+                              |  Complete flows: Auth -> Sub -> Webhook|
+                              +-------------------+-------------------+
+                                                  |
+                                                  v
+                               +---------------------------------------+
+                               |           Integration Tests           |
+                               |  FastAPI TestClient + Real Postgres DB|
+                               +------------------+--------------------+
+                                                  |
+                                                  v
+                               +---------------------------------------+
+                               |               Unit Tests              |
+                               | Pure functions: HMAC validation, math |
+                               +---------------------------------------+
+
+```
+
+### Testing Enforcements
+
+* **Database Isolation:** Integration tests execute against an isolated test PostgreSQL container utilizing SQLAlchemy nested transactions (`SAVEPOINT`) that roll back completely after each test case.
+* **Concurrent Request Simulation:** Concurrent payment processing tests fire parallel requests sharing identical `idempotency_key` values using `asyncio.gather()` to verify atomic database lock behavior (`SELECT ... FOR UPDATE`).
+* **Mock Verification:** External payment gateways (Stripe, Telegram Stars) are mocked via abstract interface classes to test payment success, failure, and timeout state machine paths.
+
+---
+
+## 8. Deployment Plan & Infrastructure
+
+Deployment utilizes Docker containers coordinated via Docker Compose behind Nginx for production setups.
+
+```yaml
+version: '3.8'
+
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/letsencrypt:ro
+    depends_on:
+      - backend
+
+  backend:
+    build: .
+    command: gunicorn app.main:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://app_user:${DB_PASSWORD}@postgres:5432/telegram_os
+      - REDIS_URL=redis://redis:6379/0
+      - BOT_TOKEN=${BOT_TOKEN}
+      - JWT_SECRET=${JWT_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  bot_worker:
+    build: .
+    command: python -m app.bot.bot
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://app_user:${DB_PASSWORD}@postgres:5432/telegram_os
+      - REDIS_URL=redis://redis:6379/0
+      - BOT_TOKEN=${BOT_TOKEN}
+    depends_on:
+      - backend
+
+  async_worker:
+    build: .
+    command: arq app.workers.worker.WorkerSettings
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://app_user:${DB_PASSWORD}@postgres:5432/telegram_os
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - backend
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: telegram_os
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app_user -d telegram_os"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pg_data:
+
+```
+
+### Backup & Disaster Recovery
+
+* **Database Backups:** Daily automated `pg_dump` cron execution targeting encrypted offsite S3-compatible storage with a 30-day retention policy.
+* **Write-Ahead Logging (WAL):** Postgres WAL archiving enabled for point-in-time recovery (PITR) within a 24-hour window.
+
+---
+
+## 9. Phased Development Roadmap
+
+```
++-----------------------------------------------------------------------------------+
+| PHASE 1: Architecture Blueprint & Database Foundations                            |
+| Deliverables: Complete DDL, Alembic baseline, Docker configuration, Core Config.  |
++-----------------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+| PHASE 2: Core Service Layer & Authentication                                      |
+| Deliverables: HMAC initData verification, JWT issuance, User & RBAC endpoints.     |
++-----------------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+| PHASE 3: Telegram Bot Integration (aiogram 3.x)                                   |
+| Deliverables: Webhook router, command handlers, FSM workflows, TMA launch button|
++-----------------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+| PHASE 4: Telegram Mini App Frontend                                               |
+| Deliverables: React SPA integration, WebApp SDK wrapper, Profile & Catalog views.|
++-----------------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+| PHASE 5: Admin Panel & Analytics Dashboard                                         |
+| Deliverables: Metric graphs, User control panel, Plan CRUD, System audit logs.    |
++-----------------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+| PHASE 6: Subscriptions, Payments & Ledger Engine                                 |
+| Deliverables: Payment abstraction, Webhook handlers, Idempotency lock guards.     |
++-----------------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+| PHASE 7: Security Hardening & Rate Limiting                                      |
+| Deliverables: Token-bucket middleware, Security audit pass, Access matrix checks.|
++-----------------------------------------------------------------------------------+
+                                      |
+                                      v
++-----------------------------------------------------------------------------------+
+| PHASE 8: Test Suite Execution & Production Deployment                             |
+| Deliverables: Integration test coverage, CI/CD pipeline set up, Production launch |
++-----------------------------------------------------------------------------------+
+
+```
+
+---
+
+## 10. Major Technical Risks & Mitigation Strategies
+
+### 1. Telegram API Rate Limits
+
+* **Risk:** Mass notification broadcasts triggering HTTP `429 Too Many Requests` responses from Telegram API servers.
+* **Mitigation:** Worker queues route all Telegram outbound calls through an asynchronous queue limited to 25 messages/second, employing exponential backoff with jitter when encountering `429 Retry-After` headers.
+
+### 2. Payment Webhook Duplication / Replay Attacks
+
+* **Risk:** Third-party payment gateways retrying successful webhook calls, potentially granting duplicate subscription durations.
+* **Mitigation:** Strict database idempotency keys on the `transactions` table. Webhook processing executes inside an explicit serializable database transaction checking transaction status prior to applying user entitlement updates.
+
+### 3. Concurrent Subscription State Mutation
+
+* **Risk:** Simultaneous requests triggering conflicting updates to a user's subscription lifecycle state.
+* **Mitigation:** Row-level pessimistic locking (`SELECT FOR UPDATE`) on the `user_subscriptions` table during active update transactions to block race conditions.
+
+---
+
+### Documented Blueprint Assumptions
+
+* All backend services run in UTC time zone settings.
+* Initial external payment integration targets Telegram Stars and Stripe API v3.
+* Production hosting target is a single or multi-node Linux VPS environment with Docker runtime support.
